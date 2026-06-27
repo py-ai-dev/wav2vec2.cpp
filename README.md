@@ -6,7 +6,6 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"/></a>
   <img src="https://img.shields.io/badge/C%2B%2B-17-blue.svg" alt="C++17"/>
   <img src="https://img.shields.io/badge/deps-none-brightgreen.svg" alt="No dependencies"/>
-  <img src="https://img.shields.io/badge/models-9%2C642-purple.svg" alt="9,642 models"/>
   <img src="https://img.shields.io/badge/platform-linux%20%7C%20mac%20%7C%20windows-lightgrey.svg" alt="Cross-platform"/>
 </p>
 
@@ -14,7 +13,7 @@
 
 **Fast CPU inference for [wav2vec2](https://huggingface.co/docs/transformers/model_doc/wav2vec2) ASR models — no Python, no PyTorch, no CUDA required.**
 
-[whisper.cpp](https://github.com/ggerganov/whisper.cpp) did this for Whisper. wav2vec2 has **9,642 community fine-tuned models** on HuggingFace — Telugu, Tamil, Arabic, Hindi, Swahili, Bangla, 100+ languages — and none of them had a C++ inference path until now.
+[whisper.cpp](https://github.com/ggerganov/whisper.cpp) did this for Whisper. wav2vec2 has thousands of community fine-tuned models on HuggingFace — Telugu, Tamil, Arabic, Hindi, Swahili, Bangla, 100+ languages — and none of them had a C++ inference path until now.
 
 ---
 

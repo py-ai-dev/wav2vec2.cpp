@@ -33,26 +33,19 @@
     <rect x="200" y="70"  width="6" height="20" rx="3"/>
   </g>
 
-  <!-- Main title: wav2vec2 -->
+  <!-- Main title — single text element so wav2vec2 and .cpp share the same baseline with no gap -->
   <text x="228" y="103"
         font-family="'SF Mono', 'Fira Code', 'Cascadia Code', monospace"
         font-size="56"
         font-weight="700"
-        fill="#f8fafc"
-        letter-spacing="-1">wav2vec2</text>
-
-  <!-- .cpp suffix in purple -->
-  <text x="570" y="103"
-        font-family="'SF Mono', 'Fira Code', 'Cascadia Code', monospace"
-        font-size="56"
-        font-weight="700"
-        fill="#7c3aed"
-        letter-spacing="-1">.cpp</text>
+        letter-spacing="-1">
+    <tspan fill="#f8fafc">wav2vec2</tspan><tspan fill="#7c3aed">.cpp</tspan>
+  </text>
 
   <!-- Tagline -->
   <text x="228" y="130"
         font-family="-apple-system, 'Segoe UI', sans-serif"
         font-size="15"
         fill="#94a3b8"
-        letter-spacing="0.5">Fast CPU inference · 9,642 models · No Python required</text>
+        letter-spacing="0.5">Fast CPU inference · 100+ languages · No Python required</text>
 </svg>
