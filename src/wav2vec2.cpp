@@ -1,111 +1,15 @@
 #include "wav2vec2.h"
 #include "gguf.h"
+#include "ops.h"
 
-#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <cassert>
-#include <algorithm>
-#include <numeric>
 #include <vector>
 #include <string>
 #include <stdexcept>
-#include <thread>
-#include <functional>
 #include <chrono>
 #include <cstdio>
-
-// ════════════════════════════════════════════════════════════════════════════
-// Math primitives
-// ════════════════════════════════════════════════════════════════════════════
-
-static inline float gelu(float x) {
-    // tanh approximation (same as HF)
-    const float c = 0.7978845608028654f;
-    return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x * x * x)));
-}
-
-// Layer-norm over the last dim of [T, D]
-static void layer_norm(float * x, const float * w, const float * b, int T, int D, float eps = 1e-5f) {
-    for (int t = 0; t < T; t++) {
-        float * row = x + t * D;
-        float mean = 0.f, var = 0.f;
-        for (int i = 0; i < D; i++) mean += row[i];
-        mean /= D;
-        for (int i = 0; i < D; i++) { float d = row[i] - mean; var += d * d; }
-        var /= D;
-        float inv = 1.f / sqrtf(var + eps);
-        for (int i = 0; i < D; i++) row[i] = (row[i] - mean) * inv * w[i] + b[i];
-    }
-}
-
-// GroupNorm(num_groups=C, num_channels=C) — normalises over T per channel
-// Used in wav2vec2-base feature extractor first conv layer
-static void group_norm_per_channel(float * x, const float * w, const float * b,
-                                   int T, int C, float eps = 1e-5f) {
-    for (int c = 0; c < C; c++) {
-        float mean = 0.f, var = 0.f;
-        for (int t = 0; t < T; t++) mean += x[t * C + c];
-        mean /= T;
-        for (int t = 0; t < T; t++) { float d = x[t * C + c] - mean; var += d * d; }
-        var /= T;
-        float inv = 1.f / sqrtf(var + eps);
-        for (int t = 0; t < T; t++) x[t * C + c] = (x[t * C + c] - mean) * inv * w[c] + b[c];
-    }
-}
-
-// y[m][n] = sum_k A[m][k] * B[k][n]   — naive; fast enough for inference
-static void matmul(const float * A, const float * B, float * C,
-                   int M, int K, int N) {
-    for (int m = 0; m < M; m++)
-        for (int n = 0; n < N; n++) {
-            float s = 0.f;
-            for (int k = 0; k < K; k++) s += A[m * K + k] * B[k * N + n];
-            C[m * N + n] = s;
-        }
-}
-
-// y[m][n] += b[n]
-static void add_bias(float * y, const float * b, int M, int N) {
-    for (int m = 0; m < M; m++)
-        for (int n = 0; n < N; n++) y[m * N + n] += b[n];
-}
-
-// Conv1D: x [L, Cin] — weights [Cout, Cin, K] — stride, padding
-// out [L_out, Cout]  where L_out = (L + 2*pad - K) / stride + 1
-static std::vector<float> conv1d(const float * x, const float * w, const float * b,
-                                  int L, int Cin, int Cout, int K,
-                                  int stride, int padding, int groups = 1) {
-    assert(Cin  % groups == 0);
-    assert(Cout % groups == 0);
-    int L_out = (L + 2 * padding - K) / stride + 1;
-    int Cin_g  = Cin  / groups;
-    int Cout_g = Cout / groups;
-    std::vector<float> out(L_out * Cout, 0.f);
-    for (int g = 0; g < groups; g++) {
-        for (int t = 0; t < L_out; t++) {
-            for (int oc = 0; oc < Cout_g; oc++) {
-                float s = b ? b[g * Cout_g + oc] : 0.f;
-                for (int ic = 0; ic < Cin_g; ic++)
-                    for (int k = 0; k < K; k++) {
-                        int src = t * stride + k - padding;
-                        if (src >= 0 && src < L)
-                            s += x[src * Cin + g * Cin_g + ic]
-                               * w[(g * Cout_g + oc) * (Cin_g * K) + ic * K + k];
-                    }
-                out[t * Cout + g * Cout_g + oc] = s;
-            }
-        }
-    }
-    return out;
-}
-
-static void softmax_inplace(float * x, int n) {
-    float mx = *std::max_element(x, x + n);
-    float s = 0.f;
-    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - mx); s += x[i]; }
-    for (int i = 0; i < n; i++) x[i] /= s;
-}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Model structs
@@ -286,19 +190,6 @@ void wav2vec2_free(wav2vec2_context * ctx) { delete ctx; }
 // Forward pass
 // ════════════════════════════════════════════════════════════════════════════
 
-// Linear: y [M, N] = x [M, K] @ W.T [N, K] + b [N]
-static std::vector<float> linear(const float * x, const std::vector<float> & W,
-                                  const std::vector<float> & b, int M, int K, int N) {
-    std::vector<float> y(M * N);
-    for (int m = 0; m < M; m++)
-        for (int n = 0; n < N; n++) {
-            float s = b[n];
-            for (int k = 0; k < K; k++) s += x[m * K + k] * W[n * K + k]; // W is [N, K]
-            y[m * N + n] = s;
-        }
-    return y;
-}
-
 static std::vector<float> feature_extract(const Wav2Vec2Model & m,
                                            const float * audio, int n) {
     // First conv: [n, 1] → [L0, 512]
@@ -308,20 +199,20 @@ static std::vector<float> feature_extract(const Wav2Vec2Model & m,
     int L = n;
     for (int i = 0; i < m.n_conv_layers; i++) {
         const auto & cl = m.conv_layers[i];
-        auto next = conv1d(cur.data(), cl.weight.data(), cl.bias.data(),
+        auto next = wv2_conv1d(cur.data(), cl.weight.data(), cl.bias.data(),
                            L, cl.Cin, cl.Cout, cl.K, cl.stride, /*pad=*/0);
         L = (L - cl.K) / cl.stride + 1;
 
         // Apply activation
-        for (auto & v : next) v = gelu(v);
+        for (auto & v : next) v = wv2_gelu(v);
 
         // Apply norm if present
         if (cl.has_norm) {
             if (m.feat_norm == "group") {
-                group_norm_per_channel(next.data(), cl.ln_w.data(), cl.ln_b.data(), L, cl.Cout);
+                wv2_group_norm(next.data(), cl.ln_w.data(), cl.ln_b.data(), L, cl.Cout);
             } else {
                 // layer norm: normalise over channels at each time step
-                layer_norm(next.data(), cl.ln_w.data(), cl.ln_b.data(), L, cl.Cout);
+                wv2_layer_norm(next.data(), cl.ln_w.data(), cl.ln_b.data(), L, cl.Cout);
             }
         }
         cur = std::move(next);
@@ -334,9 +225,9 @@ static void self_attention(const TransformerLayer & el, float * x, int T, int H,
     int d = H / n_heads;
     float scale = 1.f / sqrtf((float)d);
 
-    auto Q = linear(x, el.attn.q_w, el.attn.q_b, T, H, H); // [T, H]
-    auto K = linear(x, el.attn.k_w, el.attn.k_b, T, H, H);
-    auto V = linear(x, el.attn.v_w, el.attn.v_b, T, H, H);
+    auto Q = wv2_linear(x, el.attn.q_w, el.attn.q_b, T, H, H); // [T, H]
+    auto K = wv2_linear(x, el.attn.k_w, el.attn.k_b, T, H, H);
+    auto V = wv2_linear(x, el.attn.v_w, el.attn.v_b, T, H, H);
 
     std::vector<float> out(T * H, 0.f);
 
@@ -362,7 +253,7 @@ static void self_attention(const TransformerLayer & el, float * x, int T, int H,
     }
 
     // Output projection: in-place
-    auto proj = linear(out.data(), el.attn.out_w, el.attn.out_b, T, H, H);
+    auto proj = wv2_linear(out.data(), el.attn.out_w, el.attn.out_b, T, H, H);
     memcpy(x, proj.data(), T * H * sizeof(float));
 }
 
@@ -371,26 +262,26 @@ static std::vector<float> encode(const Wav2Vec2Model & m,
     int H = m.hidden;
 
     // Feature projection: [T, conv_dim] → [T, H]
-    auto x = linear(feat, m.proj_w, m.proj_b, T, m.conv_dim, H);
+    auto x = wv2_linear(feat, m.proj_w, m.proj_b, T, m.conv_dim, H);
     // Feature projection layer norm (applied to conv_dim-side before projection in HF)
     // Note: HF applies layer_norm to the raw conv features, then projects.
     // We stored proj weights to match: just LN the result here.
-    layer_norm(x.data(), m.proj_ln_w.data(), m.proj_ln_b.data(), T, H);
+    wv2_layer_norm(x.data(), m.proj_ln_w.data(), m.proj_ln_b.data(), T, H);
 
     // Positional conv embedding
     int pk = m.pos_conv_kernel, pg = m.pos_conv_groups;
     int pad = pk / 2;
-    auto pos = conv1d(x.data(), m.pos_w.data(), m.pos_b.data(),
+    auto pos = wv2_conv1d(x.data(), m.pos_w.data(), m.pos_b.data(),
                       T, H, H, pk, 1, pad, pg);
     // pos may be T+1 if kernel is even — trim
     int pos_T = (int)pos.size() / H;
     int use_T = std::min(T, pos_T);
-    for (auto & v : pos) v = gelu(v);
+    for (auto & v : pos) v = wv2_gelu(v);
     for (int t = 0; t < use_T; t++)
         for (int i = 0; i < H; i++) x[t * H + i] += pos[t * H + i];
 
     // Encoder layer norm
-    layer_norm(x.data(), m.enc_ln_w.data(), m.enc_ln_b.data(), T, H);
+    wv2_layer_norm(x.data(), m.enc_ln_w.data(), m.enc_ln_b.data(), T, H);
 
     // Transformer layers
     std::vector<float> buf(T * H);
@@ -399,15 +290,15 @@ static std::vector<float> encode(const Wav2Vec2Model & m,
         memcpy(buf.data(), x.data(), T * H * sizeof(float));
         self_attention(el, buf.data(), T, H, m.n_heads);
         for (int i = 0; i < T * H; i++) x[i] += buf[i];   // residual
-        layer_norm(x.data(), el.ln1_w.data(), el.ln1_b.data(), T, H);
+        wv2_layer_norm(x.data(), el.ln1_w.data(), el.ln1_b.data(), T, H);
 
         // Feed-forward block
         memcpy(buf.data(), x.data(), T * H * sizeof(float));
-        auto ff1 = linear(buf.data(), el.ff.fc1_w, el.ff.fc1_b, T, H, m.intermediate);
-        for (auto & v : ff1) v = gelu(v);
-        auto ff2 = linear(ff1.data(), el.ff.fc2_w, el.ff.fc2_b, T, m.intermediate, H);
+        auto ff1 = wv2_linear(buf.data(), el.ff.fc1_w, el.ff.fc1_b, T, H, m.intermediate);
+        for (auto & v : ff1) v = wv2_gelu(v);
+        auto ff2 = wv2_linear(ff1.data(), el.ff.fc2_w, el.ff.fc2_b, T, m.intermediate, H);
         for (int i = 0; i < T * H; i++) x[i] += ff2[i];   // residual
-        layer_norm(x.data(), el.ln2_w.data(), el.ln2_b.data(), T, H);
+        wv2_layer_norm(x.data(), el.ln2_w.data(), el.ln2_b.data(), T, H);
     }
     return x; // [T, H]
 }
@@ -468,7 +359,7 @@ wav2vec2_result * wav2vec2_transcribe(wav2vec2_context * ctx,
     auto enc = encode(m, feat.data(), T);
 
     // 3. CTC head
-    auto logits = linear(enc.data(), m.lm_w, m.lm_b, T, m.hidden, m.vocab_size);
+    auto logits = wv2_linear(enc.data(), m.lm_w, m.lm_b, T, m.hidden, m.vocab_size);
 
     // 4. Decode
     std::string text = ctc_decode(logits.data(), T, m.vocab_size,

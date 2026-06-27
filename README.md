@@ -1,12 +1,32 @@
-# wav2vec2.cpp
+<p align="center">
+  <img src="media/logo.svg" alt="wav2vec2.cpp" width="720"/>
+</p>
 
-Fast CPU inference for [wav2vec2](https://huggingface.co/docs/transformers/model_doc/wav2vec2) ASR models — no Python, no PyTorch.
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"/></a>
+  <img src="https://img.shields.io/badge/C%2B%2B-17-blue.svg" alt="C++17"/>
+  <img src="https://img.shields.io/badge/deps-none-brightgreen.svg" alt="No dependencies"/>
+  <img src="https://img.shields.io/badge/models-9%2C642-purple.svg" alt="9,642 models"/>
+  <img src="https://img.shields.io/badge/platform-linux%20%7C%20mac%20%7C%20windows-lightgrey.svg" alt="Cross-platform"/>
+</p>
 
-> **9,642 wav2vec2 models on HuggingFace. Zero had a C++ inference path. Until now.**
+---
 
-## Why
+**Fast CPU inference for [wav2vec2](https://huggingface.co/docs/transformers/model_doc/wav2vec2) ASR models — no Python, no PyTorch, no CUDA required.**
 
-[whisper.cpp](https://github.com/ggerganov/whisper.cpp) brought Whisper to every device. wav2vec2 has almost as many community fine-tunes (Telugu, Tamil, Arabic, Swahili, Bangla, 100+ languages) and none of them run without a Python stack. This project fixes that.
+[whisper.cpp](https://github.com/ggerganov/whisper.cpp) did this for Whisper. wav2vec2 has **9,642 community fine-tuned models** on HuggingFace — Telugu, Tamil, Arabic, Hindi, Swahili, Bangla, 100+ languages — and none of them had a C++ inference path until now.
+
+---
+
+## Features
+
+- **Zero dependencies** — C++17 stdlib only, builds with `cmake && make`
+- **Universal** — converts any `Wav2Vec2ForCTC` model from HuggingFace to GGUF
+- **F16 + F32** — half-precision storage halves model size with minimal quality loss
+- **Built-in WAV reader** — no libsndfile, no miniaudio; just a file path
+- **Greedy CTC decoder** — correct, fast, handles all standard vocabularies
+- **ARM + x86** — NEON and AVX2 compiler flags included
+- **Tested** — unit tests for every math primitive and the GGUF reader
 
 ## Build
 
@@ -17,88 +37,134 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-Produces `build/wav2vec2-cli`.
+Run tests:
+```bash
+cd build && ctest --output-on-failure
+```
 
-**Requirements:** C++17 compiler, CMake ≥ 3.14. No other dependencies.
+**Requirements:** C++17 compiler, CMake ≥ 3.14. Nothing else.
 
-## Usage
+## Quick Start
 
-### 1 — Convert a HuggingFace model to GGUF
+### 1. Convert a model
 
 ```bash
 pip install transformers torch
 python scripts/convert_to_gguf.py facebook/wav2vec2-base-960h model.gguf
-# f16 by default; add --dtype f32 for full precision
 ```
 
-Works with any `Wav2Vec2ForCTC` model on HuggingFace.
+Add `--dtype f32` for full precision (default is f16, ~2× smaller file).
 
-### 2 — Transcribe
+### 2. Transcribe
 
 ```bash
 ./build/wav2vec2-cli -m model.gguf -f audio.wav
 ```
 
-Options:
 ```
--m  model.gguf       path to GGUF model
--f  audio.wav        input audio (WAV, 16 kHz mono recommended)
--t  4                number of threads (default: 4)
--v                   verbose — print timing info
+usage: wav2vec2-cli -m MODEL -f AUDIO [-t THREADS] [-v]
+
+  -m  model.gguf    GGUF model file
+  -f  audio.wav     input WAV (16 kHz mono recommended; stereo/other rates auto-handled)
+  -t  4             number of threads (default: 4)
+  -v                verbose output with timing
 ```
 
-### Examples
+## Examples
 
 ```bash
-# English (facebook/wav2vec2-base-960h)
-python scripts/convert_to_gguf.py facebook/wav2vec2-base-960h en.gguf
+# English (360 MB base model)
+python scripts/convert_to_gguf.py facebook/wav2vec2-base-960h      en.gguf
 ./build/wav2vec2-cli -m en.gguf -f speech.wav
 
-# Telugu (liodon-ai/whisper-large-v3-te or any XLS-R Telugu fine-tune)
-python scripts/convert_to_gguf.py vasista22/wav2vec2-telugu-large te.gguf
-./build/wav2vec2-cli -m te.gguf -f telugu_speech.wav
+# Telugu
+python scripts/convert_to_gguf.py vasista22/wav2vec2-telugu-large   te.gguf
+./build/wav2vec2-cli -m te.gguf -f telugu.wav
 
-# Arabic, Hindi, Swahili, 100+ other languages — same command
-python scripts/convert_to_gguf.py any/wav2vec2-finetuned-model lang.gguf
-./build/wav2vec2-cli -m lang.gguf -f audio.wav
+# Arabic (XLS-R fine-tune)
+python scripts/convert_to_gguf.py jonatasgrosman/wav2vec2-large-xlsr-53-arabic  ar.gguf
+./build/wav2vec2-cli -m ar.gguf -f arabic.wav
+
+# Any other language — same pattern
+python scripts/convert_to_gguf.py <any-wav2vec2-ctc-model> out.gguf
+./build/wav2vec2-cli -m out.gguf -f audio.wav
 ```
 
 ## Architecture
 
-wav2vec2 is simpler than Whisper — encoder-only with CTC decoding, no autoregressive decoder:
-
 ```
 raw audio (16 kHz float32)
-  → CNN feature extractor  (7 conv layers, stride 320 total → ~49 frames/sec)
-  → feature projection     (linear + layer norm)
-  → positional conv embed  (conv1d grouped, adds position info)
-  → transformer encoder    (12–24 layers, full self-attention)
-  → CTC head               (linear → argmax → remove blanks/duplicates)
-  → transcript
+  ↓
+CNN Feature Extractor     7 conv layers, total stride 320 → ~49 frames/sec
+  ↓
+Feature Projection        linear + layer norm  [T × conv_dim → T × hidden]
+  ↓
+Positional Conv Embed     grouped Conv1D, adds position information
+  ↓
+Transformer Encoder       12–24 layers, full bidirectional self-attention
+  ↓
+CTC Head                  linear → argmax over vocab → remove dups/blanks
+  ↓
+transcript
 ```
 
-## Supported models
+## Supported Models
 
-Any `Wav2Vec2ForCTC` model with:
-- `feat_extract_norm`: `"group"` or `"layer"`
-- Standard 7-layer CNN feature extractor
-- Standard transformer encoder
+Any `Wav2Vec2ForCTC` checkpoint with:
 
-This covers wav2vec2-base, wav2vec2-large, XLS-R (300M, 1B), and the vast majority of community fine-tunes.
+| Config field | Supported values |
+|---|---|
+| `feat_extract_norm` | `"group"` (base) or `"layer"` (large/XLS-R) |
+| `feat_extract_activation` | `"gelu"` |
+| Architecture | standard 7-layer CNN + transformer |
+
+This covers **wav2vec2-base**, **wav2vec2-large**, **XLS-R-300M**, **XLS-R-1B**, and the vast majority of the 9,642 community fine-tunes.
 
 ## Performance
 
-Benchmarked on a 20-core ARM (Cortex-X925 + A725), 120 GB RAM:
+Tested on a 20-core ARM (Cortex-X925 + A725), 120 GB RAM:
 
-| Model       | Audio length | Inference time | RTF  |
-|-------------|-------------|----------------|------|
-| base (360M) | 10 s        | ~0.8 s         | 0.08 |
-| large (1.2G)| 10 s        | ~3.2 s         | 0.32 |
+| Model | Size | 10s audio | RTF |
+|---|---|---|---|
+| wav2vec2-base-960h | 360 MB | ~0.8 s | 0.08 |
+| wav2vec2-large-xlsr | 1.18 GB | ~3.2 s | 0.32 |
 
-RTF < 1.0 = faster than real-time.
+RTF < 1.0 = faster than real time. Both models run comfortably on CPU with no GPU.
+
+## Repository Structure
+
+```
+wav2vec2.cpp/
+├── include/wav2vec2.h          public C API
+├── src/
+│   ├── ops.h                   math primitives (gelu, layer_norm, conv1d, …)
+│   ├── gguf.h                  minimal GGUF reader
+│   └── wav2vec2.cpp            model loading + forward pass
+├── examples/main/main.cpp      CLI tool
+├── tests/
+│   ├── test_ops.cpp            unit tests — all math ops
+│   └── test_gguf.cpp           unit tests — GGUF reader
+├── scripts/convert_to_gguf.py  HuggingFace → GGUF converter
+└── CMakeLists.txt
+```
+
+## Roadmap
+
+- [ ] Beam search CTC decoder
+- [ ] Language model rescoring (KenLM)
+- [ ] Quantisation (Q8, Q4) via ggml integration
+- [ ] Python bindings
+- [ ] WASM / browser support
+- [ ] Android / iOS examples
+- [ ] Batch inference
+- [ ] Metal / CUDA backend
+
+## Contributing
+
+PRs welcome. Please add or update tests for any changed logic. Run `ctest` before submitting.
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+MIT — see [LICENSE](LICENSE).
 
 Produced by [liodon-ai](https://huggingface.co/liodon-ai).

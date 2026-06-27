@@ -38,6 +38,12 @@ if(WAV2VEC2_BUILD_EXAMPLES)
     target_link_libraries(wav2vec2-cli PRIVATE wav2vec2)
 endif()
 
+# ── Tests ────────────────────────────────────────────────────────────────────
+option(WAV2VEC2_BUILD_TESTS "Build unit tests" ON)
+if(WAV2VEC2_BUILD_TESTS)
+    add_subdirectory(tests)
+endif()
+
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS wav2vec2 wav2vec2-cli
         RUNTIME DESTINATION bin
