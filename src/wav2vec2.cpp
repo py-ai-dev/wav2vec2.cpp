@@ -257,6 +257,18 @@ void wav2vec2_free(wav2vec2_context * ctx) { delete ctx; }
 static std::vector<float> feature_extract(const Wav2Vec2Model & m,
                                            const float * audio, int n) {
     std::vector<float> cur(audio, audio + n);
+    // Wav2Vec2Processor.do_normalize=True: zero-mean unit-variance normalisation.
+    // All publicly released wav2vec2 models expect this preprocessing.
+    {
+        float mean = 0.f;
+        for (float s : cur) mean += s;
+        mean /= (float)n;
+        float var = 0.f;
+        for (float s : cur) { float d = s - mean; var += d * d; }
+        var /= (float)n;
+        float inv = 1.f / std::sqrt(var + 1e-7f);
+        for (float & s : cur) s = (s - mean) * inv;
+    }
     int L = n;
     for (int i = 0; i < m.n_conv_layers; i++) {
         const auto & cl = m.conv_layers[i];
