@@ -180,7 +180,8 @@ wav2vec2_context * wav2vec2_init(const char * path) {
         auto & cl  = m.conv_layers[i];
         std::string p = "feature_extractor.conv_layers." + std::to_string(i);
         cl.weight = std::vector<float>(gf.tensors.at(p + ".conv.weight").data);
-        cl.bias   = std::vector<float>(gf.tensors.at(p + ".conv.bias").data);
+        if (gf.tensors.count(p + ".conv.bias"))
+            cl.bias = std::vector<float>(gf.tensors.at(p + ".conv.bias").data);
         cl.Cout   = m.conv_dim;
         cl.Cin    = in_ch;
         cl.K      = m.conv_kernel[i];
@@ -254,7 +255,8 @@ static std::vector<float> feature_extract(const Wav2Vec2Model & m,
     int L = n;
     for (int i = 0; i < m.n_conv_layers; i++) {
         const auto & cl = m.conv_layers[i];
-        auto next = wv2_conv1d(cur.data(), cl.weight.data(), cl.bias.data(),
+        auto next = wv2_conv1d(cur.data(), cl.weight.data(),
+                               cl.bias.empty() ? nullptr : cl.bias.data(),
                                L, cl.Cin, cl.Cout, cl.K, cl.stride, 0);
         L = (L - cl.K) / cl.stride + 1;
         if (cl.has_norm) {

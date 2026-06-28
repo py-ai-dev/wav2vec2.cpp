@@ -97,15 +97,6 @@ def quantize_q4_0(arr: np.ndarray) -> bytes:
     return bytes(out)
 
 
-# ── Weight-norm materialisation ───────────────────────────────────────────────
-
-def compute_weight_norm(weight_v, weight_g):
-    """w = g * v / ||v||  (positional conv uses weight_norm)"""
-    norm = np.linalg.norm(weight_v.reshape(weight_v.shape[0], -1), axis=1)
-    norm = norm[:, None, None] if weight_v.ndim == 3 else norm[:, None]
-    return weight_g * weight_v / (norm + 1e-12)
-
-
 # ── Main conversion ───────────────────────────────────────────────────────────
 
 # Names of linear weight matrices (candidates for quantization).
@@ -184,7 +175,8 @@ def convert(model_id: str, out_path: str, dtype: str = "f16"):
         p  = f"wav2vec2.feature_extractor.conv_layers.{i}"
         op = f"feature_extractor.conv_layers.{i}"
         add(f"{op}.conv.weight", sd[f"{p}.conv.weight"])
-        add(f"{op}.conv.bias",   sd[f"{p}.conv.bias"])
+        if f"{p}.conv.bias" in sd:
+            add(f"{op}.conv.bias", sd[f"{p}.conv.bias"])
         if f"{p}.layer_norm.weight" in sd:
             add(f"{op}.layer_norm.weight", sd[f"{p}.layer_norm.weight"])
             add(f"{op}.layer_norm.bias",   sd[f"{p}.layer_norm.bias"])
@@ -195,15 +187,12 @@ def convert(model_id: str, out_path: str, dtype: str = "f16"):
     add("feature_projection.projection.weight", sd["wav2vec2.feature_projection.projection.weight"])
     add("feature_projection.projection.bias",   sd["wav2vec2.feature_projection.projection.bias"])
 
-    # Positional conv (materialise weight_norm)
-    wv_key = "wav2vec2.encoder.pos_conv_embed.conv.weight_v"
-    wg_key = "wav2vec2.encoder.pos_conv_embed.conv.weight_g"
-    if wv_key in sd:
-        w = compute_weight_norm(sd[wv_key].numpy(), sd[wg_key].numpy())
-    else:
-        w = sd["wav2vec2.encoder.pos_conv_embed.conv.weight"].numpy()
-    add("encoder.pos_conv_embed.conv.weight", w)
-    add("encoder.pos_conv_embed.conv.bias",   sd["wav2vec2.encoder.pos_conv_embed.conv.bias"])
+    # Positional conv — access .weight directly so parametrize/weight_norm is
+    # applied transparently regardless of transformers/torch version.
+    add("encoder.pos_conv_embed.conv.weight",
+        model.wav2vec2.encoder.pos_conv_embed.conv.weight.detach())
+    add("encoder.pos_conv_embed.conv.bias",
+        model.wav2vec2.encoder.pos_conv_embed.conv.bias.detach())
 
     # Encoder layer norm
     add("encoder.layer_norm.weight", sd["wav2vec2.encoder.layer_norm.weight"])
