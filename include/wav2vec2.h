@@ -16,6 +16,7 @@ struct wav2vec2_result {
 
 struct wav2vec2_params {
     int  n_threads;         // default: 4
+    int  beam_size;         // 1 = greedy CTC, >1 = beam search (default: 1)
     bool verbose;           // print timing info
 };
 

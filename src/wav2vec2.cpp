@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <chrono>
 #include <cstdio>
+#include <thread>
+#include <algorithm>
 
 // ════════════════════════════════════════════════════════════════════════════
 // Model structs
@@ -57,9 +59,9 @@ struct Wav2Vec2Model {
     // weights
     std::vector<ConvLayer> conv_layers;
 
-    // feature projection
-    std::vector<float> proj_w, proj_b;
-    std::vector<float> proj_ln_w, proj_ln_b;
+    // feature projection (HF order: LayerNorm(conv_dim) → Linear(conv_dim→hidden))
+    std::vector<float> proj_ln_w, proj_ln_b; // [conv_dim]
+    std::vector<float> proj_w, proj_b;        // proj_w: [hidden, conv_dim]
 
     // positional conv
     std::vector<float> pos_w, pos_b;
@@ -140,11 +142,11 @@ wav2vec2_context * wav2vec2_init(const char * path) {
         in_ch = m.conv_dim;
     }
 
-    // Feature projection
-    m.proj_w    = load_vec(gf, "feature_projection.projection.weight");
-    m.proj_b    = load_vec(gf, "feature_projection.projection.bias");
+    // Feature projection: LN weights are [conv_dim], proj weights are [hidden, conv_dim]
     m.proj_ln_w = load_vec(gf, "feature_projection.layer_norm.weight");
     m.proj_ln_b = load_vec(gf, "feature_projection.layer_norm.bias");
+    m.proj_w    = load_vec(gf, "feature_projection.projection.weight");
+    m.proj_b    = load_vec(gf, "feature_projection.projection.bias");
 
     // Positional conv
     m.pos_w = load_vec(gf, "encoder.pos_conv_embed.conv.weight");
@@ -192,142 +194,128 @@ void wav2vec2_free(wav2vec2_context * ctx) { delete ctx; }
 
 static std::vector<float> feature_extract(const Wav2Vec2Model & m,
                                            const float * audio, int n) {
-    // First conv: [n, 1] → [L0, 512]
-    std::vector<float> cur(n);
-    for (int i = 0; i < n; i++) cur[i] = audio[i]; // [n, 1] — Cin=1
+    std::vector<float> cur(audio, audio + n); // [n, 1] (Cin=1)
 
     int L = n;
     for (int i = 0; i < m.n_conv_layers; i++) {
         const auto & cl = m.conv_layers[i];
         auto next = wv2_conv1d(cur.data(), cl.weight.data(), cl.bias.data(),
-                           L, cl.Cin, cl.Cout, cl.K, cl.stride, /*pad=*/0);
+                               L, cl.Cin, cl.Cout, cl.K, cl.stride, /*pad=*/0);
         L = (L - cl.K) / cl.stride + 1;
 
-        // Apply activation
-        for (auto & v : next) v = wv2_gelu(v);
-
-        // Apply norm if present
+        // HF order: conv → norm → gelu
         if (cl.has_norm) {
             if (m.feat_norm == "group") {
                 wv2_group_norm(next.data(), cl.ln_w.data(), cl.ln_b.data(), L, cl.Cout);
             } else {
-                // layer norm: normalise over channels at each time step
                 wv2_layer_norm(next.data(), cl.ln_w.data(), cl.ln_b.data(), L, cl.Cout);
             }
         }
+        for (auto & v : next) v = wv2_gelu(v);
+
         cur = std::move(next);
     }
-    return cur; // [L, 512]
+    return cur; // [L, conv_dim]
 }
 
-// Multi-head self-attention: x [T, H], in-place → out [T, H]
-static void self_attention(const TransformerLayer & el, float * x, int T, int H, int n_heads) {
+// Multi-head self-attention with parallel head computation.
+// Heads are split across n_threads — writes to disjoint slices of H, no mutex needed.
+static void self_attention(const TransformerLayer & el, float * x_out,
+                            const float * x_in, int T, int H, int n_heads, int n_threads) {
     int d = H / n_heads;
     float scale = 1.f / sqrtf((float)d);
 
-    auto Q = wv2_linear(x, el.attn.q_w, el.attn.q_b, T, H, H); // [T, H]
-    auto K = wv2_linear(x, el.attn.k_w, el.attn.k_b, T, H, H);
-    auto V = wv2_linear(x, el.attn.v_w, el.attn.v_b, T, H, H);
+    // Q/K/V: [T, H]  — BLAS-accelerated when WV2_USE_BLAS is defined
+    auto Q = wv2_linear(x_in, el.attn.q_w, el.attn.q_b, T, H, H);
+    auto K = wv2_linear(x_in, el.attn.k_w, el.attn.k_b, T, H, H);
+    auto V = wv2_linear(x_in, el.attn.v_w, el.attn.v_b, T, H, H);
 
     std::vector<float> out(T * H, 0.f);
 
-    for (int h = 0; h < n_heads; h++) {
-        // Scores [T, T]
-        std::vector<float> scores(T * T);
-        for (int i = 0; i < T; i++)
-            for (int j = 0; j < T; j++) {
-                float s = 0.f;
-                for (int k = 0; k < d; k++)
-                    s += Q[i * H + h * d + k] * K[j * H + h * d + k];
-                scores[i * T + j] = s * scale;
-            }
-        // Softmax over keys
-        for (int i = 0; i < T; i++) softmax_inplace(&scores[i * T], T);
-        // Weighted sum of V → out
-        for (int i = 0; i < T; i++)
-            for (int k = 0; k < d; k++) {
-                float s = 0.f;
-                for (int j = 0; j < T; j++) s += scores[i * T + j] * V[j * H + h * d + k];
-                out[i * H + h * d + k] = s;
-            }
-    }
+    int n_t = std::min(n_threads, n_heads);
+    std::vector<std::thread> pool;
+    pool.reserve(n_t);
 
-    // Output projection: in-place
+    for (int tid = 0; tid < n_t; tid++) {
+        int h_lo = tid * n_heads / n_t;
+        int h_hi = (tid + 1) * n_heads / n_t;
+        pool.emplace_back([&, h_lo, h_hi]() {
+            for (int h = h_lo; h < h_hi; h++) {
+                std::vector<float> scores(T * T);
+                for (int i = 0; i < T; i++)
+                    for (int j = 0; j < T; j++) {
+                        float s = 0.f;
+                        for (int k = 0; k < d; k++)
+                            s += Q[i * H + h * d + k] * K[j * H + h * d + k];
+                        scores[i * T + j] = s * scale;
+                    }
+                for (int i = 0; i < T; i++) wv2_softmax(&scores[i * T], T);
+                for (int i = 0; i < T; i++)
+                    for (int k = 0; k < d; k++) {
+                        float s = 0.f;
+                        for (int j = 0; j < T; j++)
+                            s += scores[i * T + j] * V[j * H + h * d + k];
+                        out[i * H + h * d + k] = s;  // disjoint slice per head
+                    }
+            }
+        });
+    }
+    for (auto & th : pool) th.join();
+
     auto proj = wv2_linear(out.data(), el.attn.out_w, el.attn.out_b, T, H, H);
-    memcpy(x, proj.data(), T * H * sizeof(float));
+    memcpy(x_out, proj.data(), T * H * sizeof(float));
 }
 
 static std::vector<float> encode(const Wav2Vec2Model & m,
-                                  const float * feat, int T) {
+                                  const float * feat, int T, int n_threads) {
     int H = m.hidden;
 
-    // Feature projection: [T, conv_dim] → [T, H]
-    auto x = wv2_linear(feat, m.proj_w, m.proj_b, T, m.conv_dim, H);
-    // Feature projection layer norm (applied to conv_dim-side before projection in HF)
-    // Note: HF applies layer_norm to the raw conv features, then projects.
-    // We stored proj weights to match: just LN the result here.
-    wv2_layer_norm(x.data(), m.proj_ln_w.data(), m.proj_ln_b.data(), T, H);
+    // Feature projection: LayerNorm(conv_dim) first, then Linear(conv_dim → hidden).
+    // Matches HF's Wav2Vec2FeatureProjection: self.layer_norm → self.projection.
+    std::vector<float> feat_norm(feat, feat + T * m.conv_dim);
+    wv2_layer_norm(feat_norm.data(), m.proj_ln_w.data(), m.proj_ln_b.data(), T, m.conv_dim);
+    auto x = wv2_linear(feat_norm.data(), m.proj_w, m.proj_b, T, m.conv_dim, H);
 
-    // Positional conv embedding
+    // Positional conv embedding: grouped Conv1D + gelu, add to x
     int pk = m.pos_conv_kernel, pg = m.pos_conv_groups;
-    int pad = pk / 2;
     auto pos = wv2_conv1d(x.data(), m.pos_w.data(), m.pos_b.data(),
-                      T, H, H, pk, 1, pad, pg);
-    // pos may be T+1 if kernel is even — trim
-    int pos_T = (int)pos.size() / H;
-    int use_T = std::min(T, pos_T);
+                          T, H, H, pk, 1, /*pad=*/pk / 2, pg);
+    int use_T = std::min(T, (int)pos.size() / H);
     for (auto & v : pos) v = wv2_gelu(v);
     for (int t = 0; t < use_T; t++)
         for (int i = 0; i < H; i++) x[t * H + i] += pos[t * H + i];
 
-    // Encoder layer norm
+    // Pre-transformer layer norm
     wv2_layer_norm(x.data(), m.enc_ln_w.data(), m.enc_ln_b.data(), T, H);
 
     // Transformer layers
-    std::vector<float> buf(T * H);
+    std::vector<float> attn_buf(T * H);
     for (const auto & el : m.enc_layers) {
-        // Self-attention block (post-norm: LN after residual)
-        memcpy(buf.data(), x.data(), T * H * sizeof(float));
-        self_attention(el, buf.data(), T, H, m.n_heads);
-        for (int i = 0; i < T * H; i++) x[i] += buf[i];   // residual
+        // Self-attention with residual, then post-norm
+        self_attention(el, attn_buf.data(), x.data(), T, H, m.n_heads, n_threads);
+        for (int i = 0; i < T * H; i++) x[i] += attn_buf[i];
         wv2_layer_norm(x.data(), el.ln1_w.data(), el.ln1_b.data(), T, H);
 
-        // Feed-forward block
-        memcpy(buf.data(), x.data(), T * H * sizeof(float));
-        auto ff1 = wv2_linear(buf.data(), el.ff.fc1_w, el.ff.fc1_b, T, H, m.intermediate);
+        // Feed-forward with residual, then post-norm
+        auto ff1 = wv2_linear(x.data(), el.ff.fc1_w, el.ff.fc1_b, T, H, m.intermediate);
         for (auto & v : ff1) v = wv2_gelu(v);
         auto ff2 = wv2_linear(ff1.data(), el.ff.fc2_w, el.ff.fc2_b, T, m.intermediate, H);
-        for (int i = 0; i < T * H; i++) x[i] += ff2[i];   // residual
+        for (int i = 0; i < T * H; i++) x[i] += ff2[i];
         wv2_layer_norm(x.data(), el.ln2_w.data(), el.ln2_b.data(), T, H);
     }
     return x; // [T, H]
 }
 
-// Greedy CTC decode
-static std::string ctc_decode(const float * logits, int T, int vocab_size,
-                               int blank_id, const std::vector<std::string> & vocab,
-                               const std::string & word_delim) {
-    std::vector<int> ids(T);
-    for (int t = 0; t < T; t++) {
-        int best = 0;
-        float best_v = logits[t * vocab_size];
-        for (int v = 1; v < vocab_size; v++)
-            if (logits[t * vocab_size + v] > best_v) { best_v = logits[t * vocab_size + v]; best = v; }
-        ids[t] = best;
-    }
-    // Remove consecutive duplicates then blank
+// Map decoded token ids → transcript string
+static std::string ids_to_text(const std::vector<int> & ids, int blank_id,
+                                const std::vector<std::string> & vocab,
+                                const std::string & word_delim) {
     std::string result;
-    int prev = -1;
     for (int id : ids) {
-        if (id == prev) continue;
-        prev = id;
-        if (id == blank_id) continue;
-        if (id < (int)vocab.size()) {
-            const auto & tok = vocab[id];
-            result += (tok == word_delim) ? " " : tok;
-        }
+        if (id == blank_id || id < 0 || id >= (int)vocab.size()) continue;
+        const auto & tok = vocab[id];
+        result += (tok == word_delim) ? " " : tok;
     }
-    // Trim leading/trailing spaces
     auto start = result.find_first_not_of(' ');
     auto end   = result.find_last_not_of(' ');
     if (start == std::string::npos) return "";
@@ -339,14 +327,17 @@ static std::string ctc_decode(const float * logits, int T, int vocab_size,
 // ════════════════════════════════════════════════════════════════════════════
 
 wav2vec2_params wav2vec2_default_params() {
-    return { .n_threads = 4, .verbose = false };
+    wav2vec2_params p{};
+    p.n_threads = 4;
+    p.beam_size = 1;
+    p.verbose   = false;
+    return p;
 }
 
 wav2vec2_result * wav2vec2_transcribe(wav2vec2_context * ctx,
                                        wav2vec2_params     params,
                                        const float       * samples,
                                        int                 n_samples) {
-    (void)params; // threading reserved for future
     const auto & m = ctx->model;
 
     auto t0 = std::chrono::steady_clock::now();
@@ -355,24 +346,36 @@ wav2vec2_result * wav2vec2_transcribe(wav2vec2_context * ctx,
     auto feat = feature_extract(m, samples, n_samples);
     int T = (int)feat.size() / m.conv_dim;
 
-    // 2. Encoder
-    auto enc = encode(m, feat.data(), T);
+    // 2. Encoder (attention parallelised over n_threads)
+    auto enc = encode(m, feat.data(), T, params.n_threads);
 
     // 3. CTC head
     auto logits = wv2_linear(enc.data(), m.lm_w, m.lm_b, T, m.hidden, m.vocab_size);
 
-    // 4. Decode
-    std::string text = ctc_decode(logits.data(), T, m.vocab_size,
-                                  m.pad_id, m.vocab, m.word_delimiter);
+    // 4. Decode — beam search or greedy
+    std::string text;
+    if (params.beam_size > 1) {
+        auto ids = wv2_ctc_beam_search(logits.data(), T, m.vocab_size,
+                                       m.pad_id, params.beam_size);
+        text = ids_to_text(ids, m.pad_id, m.vocab, m.word_delimiter);
+    } else {
+        auto ids = wv2_ctc_greedy(logits.data(), T, m.vocab_size);
+        std::vector<int> filtered;
+        for (int id : ids)
+            if (id != m.pad_id) filtered.push_back(id);
+        text = ids_to_text(filtered, m.pad_id, m.vocab, m.word_delimiter);
+    }
 
     if (params.verbose) {
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - t0).count();
-        fprintf(stderr, "wav2vec2: %d frames, %ld ms\n", T, ms);
+        fprintf(stderr, "wav2vec2: %d frames, %s(b=%d), %lld ms\n",
+                T, params.beam_size > 1 ? "beam" : "greedy",
+                params.beam_size, (long long)ms);
     }
 
     auto * res = (wav2vec2_result *)malloc(sizeof(wav2vec2_result));
-    res->n_frames  = T;
+    res->n_frames   = T;
     res->transcript = (char *)malloc(text.size() + 1);
     memcpy(res->transcript, text.c_str(), text.size() + 1);
     return res;

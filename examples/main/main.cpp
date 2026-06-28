@@ -1,6 +1,6 @@
 //  wav2vec2-cli — transcribe a WAV file using a .gguf wav2vec2 model
 //
-//  Usage: wav2vec2-cli -m model.gguf -f audio.wav [-t threads] [-v]
+//  Usage: wav2vec2-cli -m model.gguf -f audio.wav [-t threads] [-b beam] [-v]
 
 #include "wav2vec2.h"
 #include <cstdio>
@@ -91,15 +91,17 @@ int main(int argc, char ** argv) {
     const char * model_path = nullptr;
     const char * audio_path = nullptr;
     int n_threads = 4;
+    int beam_size = 1;
     bool verbose  = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i+1 < argc) model_path = argv[++i];
         else if (!strcmp(argv[i], "-f") && i+1 < argc) audio_path = argv[++i];
         else if (!strcmp(argv[i], "-t") && i+1 < argc) n_threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-b") && i+1 < argc) beam_size = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v")) verbose = true;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            fprintf(stderr, "Usage: %s -m model.gguf -f audio.wav [-t threads] [-v]\n", argv[0]);
+            fprintf(stderr, "Usage: %s -m model.gguf -f audio.wav [-t threads] [-b beam] [-v]\n", argv[0]);
             return 0;
         }
     }
@@ -121,6 +123,7 @@ int main(int argc, char ** argv) {
 
         auto params = wav2vec2_default_params();
         params.n_threads = n_threads;
+        params.beam_size = beam_size;
         params.verbose   = verbose;
 
         auto * res = wav2vec2_transcribe(ctx, params, samples.data(), (int)samples.size());

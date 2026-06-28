@@ -19,13 +19,15 @@
 
 ## Features
 
-- **Zero dependencies** — C++17 stdlib only, builds with `cmake && make`
+- **Zero dependencies** — C++17 stdlib only; optional OpenBLAS for faster matmul
 - **Universal** — converts any `Wav2Vec2ForCTC` model from HuggingFace to GGUF
 - **F16 + F32** — half-precision storage halves model size with minimal quality loss
 - **Built-in WAV reader** — no libsndfile, no miniaudio; just a file path
-- **Greedy CTC decoder** — correct, fast, handles all standard vocabularies
-- **ARM + x86** — NEON and AVX2 compiler flags included
-- **Tested** — unit tests for every math primitive and the GGUF reader
+- **Greedy + beam search CTC** — greedy by default (`-b 1`), full prefix beam search with `-b N`
+- **Multi-threaded attention** — transformer heads split across CPU cores (`-t N`)
+- **BLAS-accelerated matmul** — auto-detected at configure time (OpenBLAS, MKL, Accelerate)
+- **ARM + x86** — NEON (armv8.2-a+fp16) and AVX2+FMA compiler flags
+- **Tested** — unit tests for every math primitive, the GGUF reader, and the beam search decoder
 
 ## Build
 
@@ -41,7 +43,7 @@ Run tests:
 cd build && ctest --output-on-failure
 ```
 
-**Requirements:** C++17 compiler, CMake ≥ 3.14. Nothing else.
+**Requirements:** C++17 compiler, CMake ≥ 3.14. OpenBLAS is auto-detected for faster matrix multiply but is not required.
 
 ## Quick Start
 
@@ -61,11 +63,12 @@ Add `--dtype f32` for full precision (default is f16, ~2× smaller file).
 ```
 
 ```
-usage: wav2vec2-cli -m MODEL -f AUDIO [-t THREADS] [-v]
+usage: wav2vec2-cli -m MODEL -f AUDIO [-t THREADS] [-b BEAM] [-v]
 
   -m  model.gguf    GGUF model file
   -f  audio.wav     input WAV (16 kHz mono recommended; stereo/other rates auto-handled)
   -t  4             number of threads (default: 4)
+  -b  1             CTC beam width: 1 = greedy, 5 = beam search (default: 1)
   -v                verbose output with timing
 ```
 
@@ -117,7 +120,7 @@ Any `Wav2Vec2ForCTC` checkpoint with:
 | `feat_extract_activation` | `"gelu"` |
 | Architecture | standard 7-layer CNN + transformer |
 
-This covers **wav2vec2-base**, **wav2vec2-large**, **XLS-R-300M**, **XLS-R-1B**, and the vast majority of the 9,642 community fine-tunes.
+This covers **wav2vec2-base**, **wav2vec2-large**, **XLS-R-300M**, **XLS-R-1B**, and the vast majority of community fine-tunes.
 
 ## Performance
 
@@ -149,7 +152,6 @@ wav2vec2.cpp/
 
 ## Roadmap
 
-- [ ] Beam search CTC decoder
 - [ ] Language model rescoring (KenLM)
 - [ ] Quantisation (Q8, Q4) via ggml integration
 - [ ] Python bindings

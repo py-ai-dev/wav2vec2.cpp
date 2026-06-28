@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ── Options ───────────────────────────────────────────────────────────────────
 option(WAV2VEC2_BUILD_EXAMPLES "Build CLI examples" ON)
 option(WAV2VEC2_FAST_MATH      "Enable -ffast-math"  ON)
+option(WAV2VEC2_USE_BLAS       "Accelerate matmul with BLAS" ON)
 
 # ── Compiler flags ────────────────────────────────────────────────────────────
 add_compile_options(-O3 -Wall -Wextra)
@@ -14,7 +15,7 @@ if(WAV2VEC2_FAST_MATH)
     add_compile_options(-ffast-math)
 endif()
 
-# ARM NEON (your Cortex-X925 / A725 machine)
+# ARM NEON (Cortex-X925 / A725)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     add_compile_options(-march=armv8.2-a+fp16)
 endif()
@@ -29,7 +30,25 @@ add_library(wav2vec2 STATIC src/wav2vec2.cpp)
 target_include_directories(wav2vec2
     PUBLIC  include/
     PRIVATE src/)
-target_link_libraries(wav2vec2 PUBLIC m)  # libm for sqrtf / expf
+
+# libm for sqrtf / expf / logf
+target_link_libraries(wav2vec2 PUBLIC m)
+
+# ── Threading ─────────────────────────────────────────────────────────────────
+find_package(Threads REQUIRED)
+target_link_libraries(wav2vec2 PUBLIC Threads::Threads)
+
+# ── Optional BLAS ─────────────────────────────────────────────────────────────
+if(WAV2VEC2_USE_BLAS)
+    find_package(BLAS)
+    if(BLAS_FOUND)
+        message(STATUS "BLAS found: ${BLAS_LIBRARIES}")
+        target_link_libraries(wav2vec2 PUBLIC ${BLAS_LIBRARIES})
+        target_compile_definitions(wav2vec2 PRIVATE WV2_USE_BLAS)
+    else()
+        message(STATUS "BLAS not found — using naive matmul fallback")
+    endif()
+endif()
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if(WAV2VEC2_BUILD_EXAMPLES)

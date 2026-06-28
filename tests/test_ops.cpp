@@ -182,6 +182,49 @@ static void test_ctc_greedy() {
     ASSERT_EQ(ids2[0], 1);
 }
 
+// ── ctc_beam_search ──────────────────────────────────────────────────────────
+static void test_ctc_beam_search() {
+    // Same scenario as greedy: blank, 1, 1, blank, 2, blank → [1, 2]
+    float logits[6*4] = {
+        10,0,0,0,  // t=0: blank
+        0,10,0,0,  // t=1: token 1
+        0,10,0,0,  // t=2: token 1 (dup)
+        10,0,0,0,  // t=3: blank
+        0,0,10,0,  // t=4: token 2
+        10,0,0,0,  // t=5: blank
+    };
+    auto ids = wv2_ctc_beam_search(logits, 6, 4, 0, 5);
+    ASSERT_EQ((int)ids.size(), 2);
+    ASSERT_EQ(ids[0], 1);
+    ASSERT_EQ(ids[1], 2);
+
+    // Two same tokens separated by blank: [1, blank, 1] → [1, 1]
+    float logits2[3*3] = {
+        0,10,0,   // token 1
+        10,0,0,   // blank
+        0,10,0,   // token 1
+    };
+    auto ids2 = wv2_ctc_beam_search(logits2, 3, 3, 0, 5);
+    ASSERT_EQ((int)ids2.size(), 2);
+    ASSERT_EQ(ids2[0], 1);
+    ASSERT_EQ(ids2[1], 1);
+
+    // All blanks → empty
+    float logits3[4*2] = {
+        10,0,  10,0,  10,0,  10,0,
+    };
+    auto ids3 = wv2_ctc_beam_search(logits3, 4, 2, 0, 5);
+    ASSERT_EQ((int)ids3.size(), 0);
+
+    // Single repeated token (no blank) → single token
+    float logits4[3*2] = {
+        0,10,  0,10,  0,10,
+    };
+    auto ids4 = wv2_ctc_beam_search(logits4, 3, 2, 0, 5);
+    ASSERT_EQ((int)ids4.size(), 1);
+    ASSERT_EQ(ids4[0], 1);
+}
+
 int main() {
     fprintf(stderr, "=== ops tests ===\n");
     test_gelu();
@@ -192,5 +235,6 @@ int main() {
     test_conv1d();
     test_feature_extractor_output_length();
     test_ctc_greedy();
+    test_ctc_beam_search();
     TEST_SUITE_RESULT();
 }
