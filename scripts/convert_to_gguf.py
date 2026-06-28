@@ -114,9 +114,11 @@ def encode_tensor(name: str, arr: np.ndarray, dtype: str):
     """Return (gguf_type, raw_bytes) for a tensor given the target dtype."""
     if dtype in ("q8_0", "q4_0") and is_linear_weight(name):
         n = arr.size
-        pad = (32 - n % 32) % 32
-        if pad:
-            arr = np.append(arr.flatten(), np.zeros(pad, dtype=np.float32)).reshape(-1)
+        if n % 32 != 0:
+            # Quantization blocks require element count divisible by 32.
+            # Fall back to F16 rather than silently pad (would corrupt GGUF shape).
+            print(f"  [warn] {name}: {n} elements not divisible by 32, using F16")
+            return GGUF_F16, arr.astype(np.float16).tobytes()
         if dtype == "q8_0":
             return GGUF_Q8_0, quantize_q8_0(arr)
         else:

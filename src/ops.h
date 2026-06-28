@@ -119,6 +119,35 @@ static inline std::vector<int> wv2_ctc_greedy(const float * logits, int T, int V
     return ids;
 }
 
+// Per-emission span for word-level timestamps.
+// t_start / t_end are CTC frame indices (frame * 320 / 16000 = seconds).
+struct Wv2TokenSpan {
+    int token_id;
+    int t_start;   // first frame emitting this token
+    int t_end;     // one past last frame of this run
+};
+
+// Greedy CTC decode with frame-level timing.
+// Returns one span per unique run after duplicate collapse (includes blank spans).
+static inline std::vector<Wv2TokenSpan> wv2_ctc_greedy_spans(
+    const float * logits, int T, int V)
+{
+    std::vector<Wv2TokenSpan> spans;
+    int prev = -1, run_start = 0;
+    for (int t = 0; t < T; t++) {
+        int best = 0;
+        float best_v = logits[t * V];
+        for (int v = 1; v < V; v++)
+            if (logits[t * V + v] > best_v) { best_v = logits[t * V + v]; best = v; }
+        if (best != prev) {
+            if (prev != -1) spans.push_back({prev, run_start, t});
+            prev = best; run_start = t;
+        }
+    }
+    if (prev != -1) spans.push_back({prev, run_start, T});
+    return spans;
+}
+
 // ── CTC Beam Search ──────────────────────────────────────────────────────────
 // Returns decoded token ids (no blanks, dups already collapsed).
 // Implements Graves 2006 prefix beam search in log domain.

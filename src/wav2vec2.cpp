@@ -393,7 +393,7 @@ static std::string ids_to_text(const std::vector<int> & ids, int blank_id,
         if (id == blank_id || id < 0 || id >= (int)vocab.size()) continue;
         const auto & tok = vocab[id];
         if (tok == word_delim)      { result += ' '; continue; }
-        if (is_special_token(tok))  continue;  // strip <s>, </s>, <unk>, etc.
+        if (is_special_token(tok))  continue;
         result += tok;
     }
     auto start = result.find_first_not_of(' ');
@@ -402,16 +402,64 @@ static std::string ids_to_text(const std::vector<int> & ids, int blank_id,
     return result.substr(start, end - start + 1);
 }
 
+struct WordSpan { std::string word; int t_start; int t_end; };
+
+// Convert per-frame spans → word-level spans with timing.
+// Frame index → seconds: t * 320 / 16000 = t * 0.02
+static std::vector<WordSpan> spans_to_words(
+    const std::vector<Wv2TokenSpan> & spans,
+    int blank_id, const std::vector<std::string> & vocab,
+    const std::string & word_delim)
+{
+    std::vector<WordSpan> words;
+    std::string cur_word;
+    int cur_start = -1, cur_end = -1;
+
+    auto flush = [&]() {
+        if (cur_word.empty()) return;
+        // trim leading/trailing spaces
+        auto s = cur_word.find_first_not_of(' ');
+        auto e = cur_word.find_last_not_of(' ');
+        if (s != std::string::npos)
+            words.push_back({cur_word.substr(s, e - s + 1), cur_start, cur_end});
+        cur_word.clear(); cur_start = -1; cur_end = -1;
+    };
+
+    for (const auto & sp : spans) {
+        int id = sp.token_id;
+        if (id == blank_id || id < 0 || id >= (int)vocab.size()) continue;
+        const auto & tok = vocab[id];
+        if (is_special_token(tok)) continue;
+        if (tok == word_delim) { flush(); continue; }
+        if (cur_start < 0) cur_start = sp.t_start;
+        cur_end  = sp.t_end;
+        cur_word += tok;
+    }
+    flush();
+    return words;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Public API
 // ════════════════════════════════════════════════════════════════════════════
 
 wav2vec2_params wav2vec2_default_params() {
     wav2vec2_params p{};
-    p.n_threads = 4;
-    p.beam_size = 1;
-    p.verbose   = false;
+    p.n_threads       = 4;
+    p.beam_size       = 1;
+    p.verbose         = false;
+    p.word_timestamps = false;
     return p;
+}
+
+void wav2vec2_result_free(wav2vec2_result * res) {
+    if (!res) return;
+    free(res->transcript);
+    if (res->words) {
+        for (int i = 0; i < res->n_words; i++) free(res->words[i].text);
+        free(res->words);
+    }
+    free(res);
 }
 
 wav2vec2_result * wav2vec2_transcribe(wav2vec2_context * ctx,
@@ -426,20 +474,23 @@ wav2vec2_result * wav2vec2_transcribe(wav2vec2_context * ctx,
     int T = (int)feat.size() / m.conv_dim;
 
     auto enc = encode(m, ctx->scratch, feat.data(), T, params.n_threads);
-
     auto logits = ctx->scratch.linear(m.lm_w, enc.data(), T, m.hidden, m.vocab_size, m.lm_b, params.n_threads);
 
     std::string text;
+    std::vector<WordSpan> word_spans;
+
     if (params.beam_size > 1) {
-        auto ids = wv2_ctc_beam_search(logits.data(), T, m.vocab_size,
-                                       m.pad_id, params.beam_size);
+        // Beam search: no per-frame alignment, timestamps not supported
+        auto ids = wv2_ctc_beam_search(logits.data(), T, m.vocab_size, m.pad_id, params.beam_size);
         text = ids_to_text(ids, m.pad_id, m.vocab, m.word_delimiter);
     } else {
-        auto ids = wv2_ctc_greedy(logits.data(), T, m.vocab_size);
-        std::vector<int> filtered;
-        for (int id : ids)
-            if (id != m.pad_id) filtered.push_back(id);
-        text = ids_to_text(filtered, m.pad_id, m.vocab, m.word_delimiter);
+        auto spans = wv2_ctc_greedy_spans(logits.data(), T, m.vocab_size);
+        std::vector<int> ids;
+        for (const auto & sp : spans)
+            if (sp.token_id != m.pad_id) ids.push_back(sp.token_id);
+        text = ids_to_text(ids, m.pad_id, m.vocab, m.word_delimiter);
+        if (params.word_timestamps)
+            word_spans = spans_to_words(spans, m.pad_id, m.vocab, m.word_delimiter);
     }
 
     if (params.verbose) {
@@ -450,9 +501,21 @@ wav2vec2_result * wav2vec2_transcribe(wav2vec2_context * ctx,
                 params.beam_size, (long long)ms);
     }
 
-    auto * res = (wav2vec2_result *)malloc(sizeof(wav2vec2_result));
+    auto * res       = (wav2vec2_result *)calloc(1, sizeof(wav2vec2_result));
     res->n_frames   = T;
     res->transcript = (char *)malloc(text.size() + 1);
     memcpy(res->transcript, text.c_str(), text.size() + 1);
+
+    if (params.word_timestamps && !word_spans.empty()) {
+        res->n_words = (int)word_spans.size();
+        res->words   = (wav2vec2_word *)malloc(res->n_words * sizeof(wav2vec2_word));
+        for (int i = 0; i < res->n_words; i++) {
+            const auto & ws = word_spans[i];
+            res->words[i].t_start = ws.t_start * (320.f / 16000.f);
+            res->words[i].t_end   = ws.t_end   * (320.f / 16000.f);
+            res->words[i].text    = (char *)malloc(ws.word.size() + 1);
+            memcpy(res->words[i].text, ws.word.c_str(), ws.word.size() + 1);
+        }
+    }
     return res;
 }
