@@ -19,15 +19,14 @@
 
 ## Features
 
-- **Zero dependencies** — C++17 stdlib only; optional OpenBLAS for faster matmul
+- **ggml-powered** — ships [ggml](https://github.com/ggerganov/ggml) as a submodule: quantized matmul, SIMD kernels (NEON / AVX2), and a clear upgrade path to Metal and CUDA
+- **Q8_0 and Q4_0 quantization** — linear weights quantized at convert time; inference dequantizes on-the-fly. wav2vec2-base drops from 360 MB (F32) to 96 MB (Q8_0) or 48 MB (Q4_0)
 - **Universal** — converts any `Wav2Vec2ForCTC` model from HuggingFace to GGUF
-- **F16 + F32** — half-precision storage halves model size with minimal quality loss
 - **Built-in WAV reader** — no libsndfile, no miniaudio; just a file path
 - **Greedy + beam search CTC** — greedy by default (`-b 1`), full prefix beam search with `-b N`
 - **Multi-threaded attention** — transformer heads split across CPU cores (`-t N`)
-- **BLAS-accelerated matmul** — auto-detected at configure time (OpenBLAS, MKL, Accelerate)
-- **ARM + x86** — NEON (armv8.2-a+fp16) and AVX2+FMA compiler flags
-- **Tested** — unit tests for every math primitive, the GGUF reader, and the beam search decoder
+- **ARM + x86** — ggml auto-selects NEON / AVX2 / AVX512 at configure time
+- **Tested** — 83 unit tests covering math ops, the GGUF reader, and the beam search decoder
 
 ## Build
 
@@ -43,7 +42,13 @@ Run tests:
 cd build && ctest --output-on-failure
 ```
 
-**Requirements:** C++17 compiler, CMake ≥ 3.14. OpenBLAS is auto-detected for faster matrix multiply but is not required.
+**Requirements:** C++17 compiler, CMake ≥ 3.14. ggml is a submodule and builds automatically — no other dependencies needed.
+
+```bash
+git clone --recursive https://github.com/py-ai-dev/wav2vec2.cpp
+```
+
+(If you cloned without `--recursive`: `git submodule update --init`)
 
 ## Quick Start
 
@@ -51,10 +56,12 @@ cd build && ctest --output-on-failure
 
 ```bash
 pip install transformers torch
-python scripts/convert_to_gguf.py facebook/wav2vec2-base-960h model.gguf
+python scripts/convert_to_gguf.py facebook/wav2vec2-base-960h model.gguf          # F16 (default)
+python scripts/convert_to_gguf.py facebook/wav2vec2-base-960h model_q8.gguf --dtype q8_0  # ~96 MB
+python scripts/convert_to_gguf.py facebook/wav2vec2-base-960h model_q4.gguf --dtype q4_0  # ~48 MB
 ```
 
-Add `--dtype f32` for full precision (default is f16, ~2× smaller file).
+`--dtype` choices: `f32`, `f16` (default), `q8_0`, `q4_0`. Quantization applies only to linear weight matrices; norms, biases, and conv weights stay in F32.
 
 ### 2. Transcribe
 
@@ -153,7 +160,6 @@ wav2vec2.cpp/
 ## Roadmap
 
 - [ ] Language model rescoring (KenLM)
-- [ ] Quantisation (Q8, Q4) via ggml integration
 - [ ] Python bindings
 - [ ] WASM / browser support
 - [ ] Android / iOS examples

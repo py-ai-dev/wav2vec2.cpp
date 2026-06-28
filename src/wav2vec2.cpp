@@ -1,6 +1,7 @@
 #include "wav2vec2.h"
 #include "gguf.h"
 #include "ops.h"
+#include "ggml_backend.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -18,78 +19,108 @@
 // ════════════════════════════════════════════════════════════════════════════
 
 struct ConvLayer {
-    std::vector<float> weight; // [Cout, Cin, K]
+    std::vector<float> weight; // [Cout, Cin, K]  — always F32 (conv is not a bottleneck)
     std::vector<float> bias;   // [Cout]
-    std::vector<float> ln_w, ln_b; // layer/group norm (may be empty)
+    std::vector<float> ln_w, ln_b;
     int Cout, Cin, K, stride;
     bool has_norm;
 };
 
 struct AttnLayer {
-    std::vector<float> q_w, q_b, k_w, k_b, v_w, v_b;
-    std::vector<float> out_w, out_b;
+    ggml_tensor * q_w = nullptr; // [hidden, hidden]  quantized
+    ggml_tensor * k_w = nullptr;
+    ggml_tensor * v_w = nullptr;
+    ggml_tensor * out_w = nullptr;
+    std::vector<float> q_b, k_b, v_b, out_b; // biases stay F32
 };
 
 struct FFLayer {
-    std::vector<float> fc1_w, fc1_b;
-    std::vector<float> fc2_w, fc2_b;
+    ggml_tensor * fc1_w = nullptr; // [intermediate, hidden]
+    ggml_tensor * fc2_w = nullptr; // [hidden, intermediate]
+    std::vector<float> fc1_b, fc2_b;
 };
 
 struct TransformerLayer {
     AttnLayer attn;
     FFLayer   ff;
-    std::vector<float> ln1_w, ln1_b;   // post-attention layer norm
-    std::vector<float> ln2_w, ln2_b;   // post-FFN layer norm
+    std::vector<float> ln1_w, ln1_b;
+    std::vector<float> ln2_w, ln2_b;
 };
 
 struct Wav2Vec2Model {
     // hyperparams
     int n_conv_layers;
-    int conv_dim;           // 512
-    int n_enc_layers;       // 12/24
-    int n_heads;            // 12/16
-    int hidden;             // 768/1024
-    int intermediate;       // 3072/4096
+    int conv_dim;
+    int n_enc_layers;
+    int n_heads;
+    int hidden;
+    int intermediate;
     int vocab_size;
-    int pad_id;             // CTC blank
-    std::string feat_norm;  // "group" | "layer"
+    int pad_id;
+    std::string feat_norm;
     std::vector<int> conv_kernel, conv_stride;
     int pos_conv_kernel, pos_conv_groups;
 
-    // weights
+    // CNN feature extractor (small; kept as F32 vectors)
     std::vector<ConvLayer> conv_layers;
 
-    // feature projection (HF order: LayerNorm(conv_dim) → Linear(conv_dim→hidden))
+    // Feature projection: LN weights (conv_dim, F32) + projection (ggml, may be quantized)
     std::vector<float> proj_ln_w, proj_ln_b; // [conv_dim]
-    std::vector<float> proj_w, proj_b;        // proj_w: [hidden, conv_dim]
+    ggml_tensor * proj_w = nullptr;           // [hidden, conv_dim]
+    std::vector<float> proj_b;               // [hidden]
 
-    // positional conv
+    // Positional conv (small; F32 vector)
     std::vector<float> pos_w, pos_b;
 
-    // encoder layer norm
+    // Encoder layer norm
     std::vector<float> enc_ln_w, enc_ln_b;
 
-    // transformer
+    // Transformer
     std::vector<TransformerLayer> enc_layers;
 
-    // CTC head
-    std::vector<float> lm_w, lm_b;
+    // CTC head (ggml)
+    ggml_tensor * lm_w = nullptr; // [vocab_size, hidden]
+    std::vector<float> lm_b;     // [vocab_size]
 
-    // vocabulary: id → token string
+    // Vocabulary
     std::vector<std::string> vocab;
-    std::string word_delimiter; // typically "|"
+    std::string word_delimiter;
+
+    // ggml weight context — owns all ggml_tensor * above
+    GgmlWeights gwts;
 };
 
 struct wav2vec2_context {
     Wav2Vec2Model model;
+    GgmlScratch   scratch; // reused per-call compute scratch
 };
 
 // ════════════════════════════════════════════════════════════════════════════
 // Model loading
 // ════════════════════════════════════════════════════════════════════════════
 
-static std::vector<float> load_vec(const GgufFile & g, const std::string & name) {
-    return std::vector<float>(g.tensors.at(name).data);
+// Return the GGML type enum (as uint32) for a loaded tensor, defaulting to F32.
+static ggml_type tensor_ggml_type(const GgufTensor & gt) {
+    return (ggml_type)gt.gtype; // GgufTensorType values match ggml_type values
+}
+
+// Compute total bytes needed in the ggml weight context for a set of tensors.
+static size_t weight_ctx_size(const std::vector<const GgufTensor *> & tensors) {
+    size_t total = 0;
+    for (auto * gt : tensors) total += gt->raw.size();
+    total += tensors.size() * ggml_tensor_overhead();
+    return total;
+}
+
+// Add a 2D weight tensor to gwts from a GgufTensor.
+// The weight matrix in HuggingFace convention is [out_features, in_features].
+// ggml stores it as ne[0]=in_features (K), ne[1]=out_features (N) — same layout.
+static ggml_tensor * add_weight(GgmlWeights & gwts, const GgufTensor & gt) {
+    // shape in GGUF: innermost first, so shape[0]=in_features, shape[1]=out_features
+    // This already matches ggml convention (ne[0]=K, ne[1]=N).
+    int64_t ne0 = (int64_t)gt.shape[0];
+    int64_t ne1 = gt.shape.size() > 1 ? (int64_t)gt.shape[1] : 1;
+    return gwts.add(tensor_ggml_type(gt), ne0, ne1, gt.raw.data(), gt.raw.size());
 }
 
 wav2vec2_context * wav2vec2_init(const char * path) {
@@ -115,19 +146,41 @@ wav2vec2_context * wav2vec2_init(const char * path) {
     for (auto v : ck) m.conv_kernel.push_back((int)v);
     for (auto v : cs) m.conv_stride.push_back((int)v);
 
-    // Vocabulary
-    m.vocab      = gguf_arr_str(gf, "tokenizer.ggml.tokens");
-    m.vocab_size = (int)m.vocab.size();
+    m.vocab          = gguf_arr_str(gf, "tokenizer.ggml.tokens");
+    m.vocab_size     = (int)m.vocab.size();
     m.word_delimiter = "|";
 
-    // CNN feature extractor
+    // ── Collect all linear tensors to size the ggml context ─────────────────
+    std::vector<const GgufTensor *> linear_tensors;
+    auto register_linear = [&](const std::string & name) {
+        auto it = gf.tensors.find(name);
+        if (it == gf.tensors.end())
+            throw std::runtime_error("Missing tensor: " + name);
+        linear_tensors.push_back(&it->second);
+    };
+
+    register_linear("feature_projection.projection.weight");
+    for (int i = 0; i < m.n_enc_layers; i++) {
+        std::string p = "encoder.layers." + std::to_string(i);
+        register_linear(p + ".attention.q_proj.weight");
+        register_linear(p + ".attention.k_proj.weight");
+        register_linear(p + ".attention.v_proj.weight");
+        register_linear(p + ".attention.out_proj.weight");
+        register_linear(p + ".feed_forward.intermediate_dense.weight");
+        register_linear(p + ".feed_forward.output_dense.weight");
+    }
+    register_linear("lm_head.weight");
+
+    m.gwts.init(weight_ctx_size(linear_tensors));
+
+    // ── CNN feature extractor (F32 vectors, not ggml) ────────────────────────
     m.conv_layers.resize(m.n_conv_layers);
     int in_ch = 1;
     for (int i = 0; i < m.n_conv_layers; i++) {
         auto & cl  = m.conv_layers[i];
         std::string p = "feature_extractor.conv_layers." + std::to_string(i);
-        cl.weight = load_vec(gf, p + ".conv.weight");
-        cl.bias   = load_vec(gf, p + ".conv.bias");
+        cl.weight = std::vector<float>(gf.tensors.at(p + ".conv.weight").data);
+        cl.bias   = std::vector<float>(gf.tensors.at(p + ".conv.bias").data);
         cl.Cout   = m.conv_dim;
         cl.Cin    = in_ch;
         cl.K      = m.conv_kernel[i];
@@ -136,52 +189,55 @@ wav2vec2_context * wav2vec2_init(const char * path) {
         bool has = gf.tensors.count(p + ".layer_norm.weight") > 0;
         cl.has_norm = has;
         if (has) {
-            cl.ln_w = load_vec(gf, p + ".layer_norm.weight");
-            cl.ln_b = load_vec(gf, p + ".layer_norm.bias");
+            cl.ln_w = gf.tensors.at(p + ".layer_norm.weight").data;
+            cl.ln_b = gf.tensors.at(p + ".layer_norm.bias").data;
         }
         in_ch = m.conv_dim;
     }
 
-    // Feature projection: LN weights are [conv_dim], proj weights are [hidden, conv_dim]
-    m.proj_ln_w = load_vec(gf, "feature_projection.layer_norm.weight");
-    m.proj_ln_b = load_vec(gf, "feature_projection.layer_norm.bias");
-    m.proj_w    = load_vec(gf, "feature_projection.projection.weight");
-    m.proj_b    = load_vec(gf, "feature_projection.projection.bias");
+    // ── Feature projection ───────────────────────────────────────────────────
+    m.proj_ln_w = gf.tensors.at("feature_projection.layer_norm.weight").data;
+    m.proj_ln_b = gf.tensors.at("feature_projection.layer_norm.bias").data;
+    m.proj_b    = gf.tensors.at("feature_projection.projection.bias").data;
+    m.proj_w    = add_weight(m.gwts, gf.tensors.at("feature_projection.projection.weight"));
 
-    // Positional conv
-    m.pos_w = load_vec(gf, "encoder.pos_conv_embed.conv.weight");
-    m.pos_b = load_vec(gf, "encoder.pos_conv_embed.conv.bias");
+    // ── Positional conv (F32 vector) ─────────────────────────────────────────
+    m.pos_w = gf.tensors.at("encoder.pos_conv_embed.conv.weight").data;
+    m.pos_b = gf.tensors.at("encoder.pos_conv_embed.conv.bias").data;
 
-    // Encoder layer norm
-    m.enc_ln_w = load_vec(gf, "encoder.layer_norm.weight");
-    m.enc_ln_b = load_vec(gf, "encoder.layer_norm.bias");
+    // ── Encoder layer norm ───────────────────────────────────────────────────
+    m.enc_ln_w = gf.tensors.at("encoder.layer_norm.weight").data;
+    m.enc_ln_b = gf.tensors.at("encoder.layer_norm.bias").data;
 
-    // Transformer layers
+    // ── Transformer layers ───────────────────────────────────────────────────
     m.enc_layers.resize(m.n_enc_layers);
     for (int i = 0; i < m.n_enc_layers; i++) {
         auto & el = m.enc_layers[i];
         std::string p = "encoder.layers." + std::to_string(i);
-        el.attn.q_w   = load_vec(gf, p + ".attention.q_proj.weight");
-        el.attn.q_b   = load_vec(gf, p + ".attention.q_proj.bias");
-        el.attn.k_w   = load_vec(gf, p + ".attention.k_proj.weight");
-        el.attn.k_b   = load_vec(gf, p + ".attention.k_proj.bias");
-        el.attn.v_w   = load_vec(gf, p + ".attention.v_proj.weight");
-        el.attn.v_b   = load_vec(gf, p + ".attention.v_proj.bias");
-        el.attn.out_w = load_vec(gf, p + ".attention.out_proj.weight");
-        el.attn.out_b = load_vec(gf, p + ".attention.out_proj.bias");
-        el.ff.fc1_w   = load_vec(gf, p + ".feed_forward.intermediate_dense.weight");
-        el.ff.fc1_b   = load_vec(gf, p + ".feed_forward.intermediate_dense.bias");
-        el.ff.fc2_w   = load_vec(gf, p + ".feed_forward.output_dense.weight");
-        el.ff.fc2_b   = load_vec(gf, p + ".feed_forward.output_dense.bias");
-        el.ln1_w      = load_vec(gf, p + ".layer_norm.weight");
-        el.ln1_b      = load_vec(gf, p + ".layer_norm.bias");
-        el.ln2_w      = load_vec(gf, p + ".final_layer_norm.weight");
-        el.ln2_b      = load_vec(gf, p + ".final_layer_norm.bias");
+
+        el.attn.q_b   = gf.tensors.at(p + ".attention.q_proj.bias").data;
+        el.attn.k_b   = gf.tensors.at(p + ".attention.k_proj.bias").data;
+        el.attn.v_b   = gf.tensors.at(p + ".attention.v_proj.bias").data;
+        el.attn.out_b = gf.tensors.at(p + ".attention.out_proj.bias").data;
+        el.attn.q_w   = add_weight(m.gwts, gf.tensors.at(p + ".attention.q_proj.weight"));
+        el.attn.k_w   = add_weight(m.gwts, gf.tensors.at(p + ".attention.k_proj.weight"));
+        el.attn.v_w   = add_weight(m.gwts, gf.tensors.at(p + ".attention.v_proj.weight"));
+        el.attn.out_w = add_weight(m.gwts, gf.tensors.at(p + ".attention.out_proj.weight"));
+
+        el.ff.fc1_b   = gf.tensors.at(p + ".feed_forward.intermediate_dense.bias").data;
+        el.ff.fc2_b   = gf.tensors.at(p + ".feed_forward.output_dense.bias").data;
+        el.ff.fc1_w   = add_weight(m.gwts, gf.tensors.at(p + ".feed_forward.intermediate_dense.weight"));
+        el.ff.fc2_w   = add_weight(m.gwts, gf.tensors.at(p + ".feed_forward.output_dense.weight"));
+
+        el.ln1_w = gf.tensors.at(p + ".layer_norm.weight").data;
+        el.ln1_b = gf.tensors.at(p + ".layer_norm.bias").data;
+        el.ln2_w = gf.tensors.at(p + ".final_layer_norm.weight").data;
+        el.ln2_b = gf.tensors.at(p + ".final_layer_norm.bias").data;
     }
 
-    // CTC head
-    m.lm_w = load_vec(gf, "lm_head.weight");
-    m.lm_b = load_vec(gf, "lm_head.bias");
+    // ── CTC head ─────────────────────────────────────────────────────────────
+    m.lm_b = gf.tensors.at("lm_head.bias").data;
+    m.lm_w = add_weight(m.gwts, gf.tensors.at("lm_head.weight"));
 
     return ctx;
 }
@@ -194,41 +250,37 @@ void wav2vec2_free(wav2vec2_context * ctx) { delete ctx; }
 
 static std::vector<float> feature_extract(const Wav2Vec2Model & m,
                                            const float * audio, int n) {
-    std::vector<float> cur(audio, audio + n); // [n, 1] (Cin=1)
-
+    std::vector<float> cur(audio, audio + n);
     int L = n;
     for (int i = 0; i < m.n_conv_layers; i++) {
         const auto & cl = m.conv_layers[i];
         auto next = wv2_conv1d(cur.data(), cl.weight.data(), cl.bias.data(),
-                               L, cl.Cin, cl.Cout, cl.K, cl.stride, /*pad=*/0);
+                               L, cl.Cin, cl.Cout, cl.K, cl.stride, 0);
         L = (L - cl.K) / cl.stride + 1;
-
-        // HF order: conv → norm → gelu
         if (cl.has_norm) {
-            if (m.feat_norm == "group") {
+            if (m.feat_norm == "group")
                 wv2_group_norm(next.data(), cl.ln_w.data(), cl.ln_b.data(), L, cl.Cout);
-            } else {
+            else
                 wv2_layer_norm(next.data(), cl.ln_w.data(), cl.ln_b.data(), L, cl.Cout);
-            }
         }
         for (auto & v : next) v = wv2_gelu(v);
-
         cur = std::move(next);
     }
     return cur; // [L, conv_dim]
 }
 
-// Multi-head self-attention with parallel head computation.
-// Heads are split across n_threads — writes to disjoint slices of H, no mutex needed.
-static void self_attention(const TransformerLayer & el, float * x_out,
-                            const float * x_in, int T, int H, int n_heads, int n_threads) {
+// Multi-head self-attention with parallel heads.
+// Q/K/V projections use ggml (dequantize-on-the-fly for quantized weights).
+static void self_attention(const TransformerLayer & el, GgmlScratch & scratch,
+                            float * x_out, const float * x_in,
+                            int T, int H, int n_heads, int n_threads) {
     int d = H / n_heads;
     float scale = 1.f / sqrtf((float)d);
 
-    // Q/K/V: [T, H]  — BLAS-accelerated when WV2_USE_BLAS is defined
-    auto Q = wv2_linear(x_in, el.attn.q_w, el.attn.q_b, T, H, H);
-    auto K = wv2_linear(x_in, el.attn.k_w, el.attn.k_b, T, H, H);
-    auto V = wv2_linear(x_in, el.attn.v_w, el.attn.v_b, T, H, H);
+    // Q/K/V projections — uses ggml_mul_mat (handles quantized weights)
+    auto Q = scratch.linear(el.attn.q_w, x_in, T, H, H, el.attn.q_b, n_threads);
+    auto K = scratch.linear(el.attn.k_w, x_in, T, H, H, el.attn.k_b, n_threads);
+    auto V = scratch.linear(el.attn.v_w, x_in, T, H, H, el.attn.v_b, n_threads);
 
     std::vector<float> out(T * H, 0.f);
 
@@ -255,58 +307,52 @@ static void self_attention(const TransformerLayer & el, float * x_out,
                         float s = 0.f;
                         for (int j = 0; j < T; j++)
                             s += scores[i * T + j] * V[j * H + h * d + k];
-                        out[i * H + h * d + k] = s;  // disjoint slice per head
+                        out[i * H + h * d + k] = s;
                     }
             }
         });
     }
     for (auto & th : pool) th.join();
 
-    auto proj = wv2_linear(out.data(), el.attn.out_w, el.attn.out_b, T, H, H);
-    memcpy(x_out, proj.data(), T * H * sizeof(float));
+    auto proj = scratch.linear(el.attn.out_w, out.data(), T, H, H, el.attn.out_b, n_threads);
+    memcpy(x_out, proj.data(), (size_t)T * H * sizeof(float));
 }
 
-static std::vector<float> encode(const Wav2Vec2Model & m,
+static std::vector<float> encode(const Wav2Vec2Model & m, GgmlScratch & scratch,
                                   const float * feat, int T, int n_threads) {
     int H = m.hidden;
 
-    // Feature projection: LayerNorm(conv_dim) first, then Linear(conv_dim → hidden).
-    // Matches HF's Wav2Vec2FeatureProjection: self.layer_norm → self.projection.
+    // Feature projection: LN(conv_dim) → Linear(conv_dim → H)
     std::vector<float> feat_norm(feat, feat + T * m.conv_dim);
     wv2_layer_norm(feat_norm.data(), m.proj_ln_w.data(), m.proj_ln_b.data(), T, m.conv_dim);
-    auto x = wv2_linear(feat_norm.data(), m.proj_w, m.proj_b, T, m.conv_dim, H);
+    auto x = scratch.linear(m.proj_w, feat_norm.data(), T, m.conv_dim, H, m.proj_b, n_threads);
 
-    // Positional conv embedding: grouped Conv1D + gelu, add to x
+    // Positional conv
     int pk = m.pos_conv_kernel, pg = m.pos_conv_groups;
     auto pos = wv2_conv1d(x.data(), m.pos_w.data(), m.pos_b.data(),
-                          T, H, H, pk, 1, /*pad=*/pk / 2, pg);
+                          T, H, H, pk, 1, pk / 2, pg);
     int use_T = std::min(T, (int)pos.size() / H);
     for (auto & v : pos) v = wv2_gelu(v);
     for (int t = 0; t < use_T; t++)
         for (int i = 0; i < H; i++) x[t * H + i] += pos[t * H + i];
 
-    // Pre-transformer layer norm
     wv2_layer_norm(x.data(), m.enc_ln_w.data(), m.enc_ln_b.data(), T, H);
 
-    // Transformer layers
     std::vector<float> attn_buf(T * H);
     for (const auto & el : m.enc_layers) {
-        // Self-attention with residual, then post-norm
-        self_attention(el, attn_buf.data(), x.data(), T, H, m.n_heads, n_threads);
+        self_attention(el, scratch, attn_buf.data(), x.data(), T, H, m.n_heads, n_threads);
         for (int i = 0; i < T * H; i++) x[i] += attn_buf[i];
         wv2_layer_norm(x.data(), el.ln1_w.data(), el.ln1_b.data(), T, H);
 
-        // Feed-forward with residual, then post-norm
-        auto ff1 = wv2_linear(x.data(), el.ff.fc1_w, el.ff.fc1_b, T, H, m.intermediate);
+        auto ff1 = scratch.linear(el.ff.fc1_w, x.data(), T, H, m.intermediate, el.ff.fc1_b, n_threads);
         for (auto & v : ff1) v = wv2_gelu(v);
-        auto ff2 = wv2_linear(ff1.data(), el.ff.fc2_w, el.ff.fc2_b, T, m.intermediate, H);
+        auto ff2 = scratch.linear(el.ff.fc2_w, ff1.data(), T, m.intermediate, H, el.ff.fc2_b, n_threads);
         for (int i = 0; i < T * H; i++) x[i] += ff2[i];
         wv2_layer_norm(x.data(), el.ln2_w.data(), el.ln2_b.data(), T, H);
     }
-    return x; // [T, H]
+    return x;
 }
 
-// Map decoded token ids → transcript string
 static std::string ids_to_text(const std::vector<int> & ids, int blank_id,
                                 const std::vector<std::string> & vocab,
                                 const std::string & word_delim) {
@@ -342,17 +388,13 @@ wav2vec2_result * wav2vec2_transcribe(wav2vec2_context * ctx,
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // 1. Feature extraction
     auto feat = feature_extract(m, samples, n_samples);
     int T = (int)feat.size() / m.conv_dim;
 
-    // 2. Encoder (attention parallelised over n_threads)
-    auto enc = encode(m, feat.data(), T, params.n_threads);
+    auto enc = encode(m, ctx->scratch, feat.data(), T, params.n_threads);
 
-    // 3. CTC head
-    auto logits = wv2_linear(enc.data(), m.lm_w, m.lm_b, T, m.hidden, m.vocab_size);
+    auto logits = ctx->scratch.linear(m.lm_w, enc.data(), T, m.hidden, m.vocab_size, m.lm_b, params.n_threads);
 
-    // 4. Decode — beam search or greedy
     std::string text;
     if (params.beam_size > 1) {
         auto ids = wv2_ctc_beam_search(logits.data(), T, m.vocab_size,

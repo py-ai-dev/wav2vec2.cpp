@@ -7,7 +7,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ── Options ───────────────────────────────────────────────────────────────────
 option(WAV2VEC2_BUILD_EXAMPLES "Build CLI examples" ON)
 option(WAV2VEC2_FAST_MATH      "Enable -ffast-math"  ON)
-option(WAV2VEC2_USE_BLAS       "Accelerate matmul with BLAS" ON)
 
 # ── Compiler flags ────────────────────────────────────────────────────────────
 add_compile_options(-O3 -Wall -Wextra)
@@ -25,35 +24,32 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     add_compile_options(-mavx2 -mfma)
 endif()
 
+# ── ggml (quantized matmul, CPU-SIMD, future GPU backends) ───────────────────
+# Disable ggml's own tests/examples/CUDA/Metal when embedded as a subdirectory.
+set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GGML_CUDA           OFF CACHE BOOL "" FORCE)
+set(GGML_METAL          OFF CACHE BOOL "" FORCE)
+set(GGML_OPENCL         OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN         OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/ggml)
+
 # ── Library ───────────────────────────────────────────────────────────────────
 add_library(wav2vec2 STATIC src/wav2vec2.cpp)
 target_include_directories(wav2vec2
     PUBLIC  include/
-    PRIVATE src/)
-
-# libm for sqrtf / expf / logf
-target_link_libraries(wav2vec2 PUBLIC m)
+    PRIVATE src/
+            third_party/ggml/include/)
+target_link_libraries(wav2vec2 PUBLIC m ggml)
 
 # ── Threading ─────────────────────────────────────────────────────────────────
 find_package(Threads REQUIRED)
 target_link_libraries(wav2vec2 PUBLIC Threads::Threads)
 
-# ── Optional BLAS ─────────────────────────────────────────────────────────────
-if(WAV2VEC2_USE_BLAS)
-    find_package(BLAS)
-    if(BLAS_FOUND)
-        message(STATUS "BLAS found: ${BLAS_LIBRARIES}")
-        target_link_libraries(wav2vec2 PUBLIC ${BLAS_LIBRARIES})
-        target_compile_definitions(wav2vec2 PRIVATE WV2_USE_BLAS)
-    else()
-        message(STATUS "BLAS not found — using naive matmul fallback")
-    endif()
-endif()
-
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if(WAV2VEC2_BUILD_EXAMPLES)
     add_executable(wav2vec2-cli examples/main/main.cpp)
-    target_include_directories(wav2vec2-cli PRIVATE src/)
+    target_include_directories(wav2vec2-cli PRIVATE src/ third_party/ggml/include/)
     target_link_libraries(wav2vec2-cli PRIVATE wav2vec2)
 endif()
 

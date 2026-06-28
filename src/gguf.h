@@ -1,4 +1,4 @@
-// Minimal GGUF reader — supports F32 and F16 tensors, string/uint32/array KV.
+// Minimal GGUF reader — supports F32, F16, and quantized tensors (Q8_0, Q4_0, …).
 #pragma once
 
 #include <cstdint>
@@ -27,11 +27,48 @@ enum GgufValType : uint32_t {
     GVT_UINT32, GVT_INT32, GVT_FLOAT32, GVT_BOOL,
     GVT_STRING, GVT_ARRAY, GVT_UINT64, GVT_INT64, GVT_FLOAT64
 };
-enum GgufTensorType : uint32_t { GTT_F32=0, GTT_F16=1 };
+
+// GGML tensor type values (matches enum ggml_type in ggml.h).
+// We store the raw uint32 so we don't need to include ggml.h here.
+enum GgufTensorType : uint32_t {
+    GTT_F32  = 0,
+    GTT_F16  = 1,
+    GTT_Q4_0 = 2,
+    GTT_Q4_1 = 3,
+    GTT_Q5_0 = 6,
+    GTT_Q5_1 = 7,
+    GTT_Q8_0 = 8,
+    GTT_Q8_1 = 9,
+};
+
+// Returns the number of raw bytes for n elements of a given quantized type.
+// Quantization block sizes match ggml's internal layout (GGUF uses the same format).
+static inline size_t gguf_tensor_nbytes(GgufTensorType t, uint64_t n_elems) {
+    switch (t) {
+        case GTT_F32:  return n_elems * 4;
+        case GTT_F16:  return n_elems * 2;
+        // Q4_0: 32-element blocks, each block = 2 bytes (f16 scale) + 16 bytes (nibbles)
+        case GTT_Q4_0: return (n_elems / 32) * 18;
+        // Q4_1: 32-element blocks = 2+2 bytes (f16 scale+min) + 16 bytes
+        case GTT_Q4_1: return (n_elems / 32) * 20;
+        // Q5_0: 32-element blocks = 2 bytes (f16 scale) + 4 bytes (high bits) + 16 bytes (nibbles)
+        case GTT_Q5_0: return (n_elems / 32) * 22;
+        // Q5_1: 32-element blocks = 2+2 bytes + 4 bytes + 16 bytes
+        case GTT_Q5_1: return (n_elems / 32) * 24;
+        // Q8_0: 32-element blocks = 2 bytes (f16 scale) + 32 bytes (int8)
+        case GTT_Q8_0: return (n_elems / 32) * 34;
+        // Q8_1: 32-element blocks = 2+2 bytes + 32 bytes
+        case GTT_Q8_1: return (n_elems / 32) * 36;
+        default: return n_elems * 4; // unknown: assume F32
+    }
+}
 
 struct GgufTensor {
-    std::vector<uint64_t> shape;   // dims, innermost first
-    std::vector<float>    data;    // always f32
+    std::vector<uint64_t> shape;   // dims, innermost first (as in GGUF)
+    uint64_t              n_elems; // total element count
+    GgufTensorType        gtype;   // original GGML type
+    std::vector<float>    data;    // F32 values (populated for F32 and F16 types only)
+    std::vector<uint8_t>  raw;     // raw bytes (populated for ALL types, incl. quantized)
 };
 
 struct GgufKV {
@@ -106,7 +143,12 @@ static GgufFile gguf_load(const char * path) {
     }
 
     // Tensor info
-    struct TInfo { std::string name; std::vector<uint64_t> shape; GgufTensorType type; uint64_t offset; };
+    struct TInfo {
+        std::string         name;
+        std::vector<uint64_t> shape;
+        GgufTensorType      type;
+        uint64_t            offset;
+    };
     std::vector<TInfo> tinfos(n_tensors);
     for (auto & ti : tinfos) {
         ti.name = gguf_read_str(f);
@@ -126,16 +168,27 @@ static GgufFile gguf_load(const char * path) {
     for (auto & ti : tinfos) {
         f.seekg((std::streamoff)(data_start + ti.offset));
         uint64_t n = 1; for (auto d : ti.shape) n *= d;
-        GgufTensor gt; gt.shape = ti.shape; gt.data.resize(n);
+        size_t nbytes = gguf_tensor_nbytes(ti.type, n);
+
+        GgufTensor gt;
+        gt.shape   = ti.shape;
+        gt.n_elems = n;
+        gt.gtype   = ti.type;
+
+        // Always load raw bytes
+        gt.raw.resize(nbytes);
+        f.read((char*)gt.raw.data(), (std::streamsize)nbytes);
+
+        // For F32/F16, also populate the float32 data array for backward compatibility
         if (ti.type == GTT_F32) {
-            f.read((char*)gt.data.data(), (std::streamsize)(n * 4));
+            gt.data.resize(n);
+            memcpy(gt.data.data(), gt.raw.data(), n * 4);
         } else if (ti.type == GTT_F16) {
-            std::vector<uint16_t> tmp(n);
-            f.read((char*)tmp.data(), (std::streamsize)(n * 2));
-            for (uint64_t j = 0; j < n; j++) gt.data[j] = f16_to_f32(tmp[j]);
-        } else {
-            throw std::runtime_error("gguf: unsupported tensor type " + std::to_string((int)ti.type));
+            gt.data.resize(n);
+            const uint16_t * src = (const uint16_t *)gt.raw.data();
+            for (uint64_t j = 0; j < n; j++) gt.data[j] = f16_to_f32(src[j]);
         }
+
         gf.tensors[ti.name] = std::move(gt);
     }
     return gf;
@@ -145,6 +198,8 @@ static GgufFile gguf_load(const char * path) {
 static const float * gguf_tensor(const GgufFile & g, const std::string & n) {
     auto it = g.tensors.find(n);
     if (it == g.tensors.end()) throw std::runtime_error("Missing tensor: " + n);
+    if (it->second.data.empty())
+        throw std::runtime_error("Tensor " + n + " is quantized — use raw bytes + ggml");
     return it->second.data.data();
 }
 static uint32_t gguf_u32(const GgufFile & g, const std::string & k) {
