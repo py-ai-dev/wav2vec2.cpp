@@ -91,8 +91,8 @@ def quantize_q4_0(arr: np.ndarray) -> bytes:
         # Quantize to [0..15] unsigned by adding 8
         qs = np.clip(np.round(blk * iscale) + 8, 0, 15).astype(np.uint8)
         out += struct.pack("<e", scale)   # f16 scale
-        # Pack two nibbles per byte (lower nibble first)
-        packed = qs[0::2] | (qs[1::2] << 4)
+        # ggml Q4_0 layout: byte j = low nibble: element j, high nibble: element j+16
+        packed = qs[:16] | (qs[16:] << 4)
         out += packed.tobytes()
     return bytes(out)
 
