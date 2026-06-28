@@ -265,7 +265,12 @@ def convert(model_id: str, out_path: str, dtype: str = "f16"):
         kv_u32("wav2vec2.pad_token_id",      pad_id)
         kv_u32("wav2vec2.pos_conv_kernel",   pos_conv_kernel)
         kv_u32("wav2vec2.pos_conv_groups",   pos_conv_groups)
-        kv_str("wav2vec2.feat_extract_norm", feat_norm)
+        kv_str("wav2vec2.feat_extract_norm",   feat_norm)
+        kv_str("wav2vec2.word_delimiter_token",
+               tok.word_delimiter_token if tok.word_delimiter_token else "|")
+        write_kv_scalar(f, "wav2vec2.stable_layer_norm",
+                        bool(getattr(cfg, "do_stable_layer_norm", False)), 7)
+        kv_written += 1
         write_kv_arr_u32(f, "wav2vec2.conv_kernel", conv_kernel); kv_written += 1
         write_kv_arr_u32(f, "wav2vec2.conv_stride", conv_stride); kv_written += 1
         write_kv_arr_str(f, "tokenizer.ggml.tokens", vocab);      kv_written += 1

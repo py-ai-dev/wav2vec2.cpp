@@ -58,6 +58,7 @@ struct Wav2Vec2Model {
     int vocab_size;
     int pad_id;
     std::string feat_norm;
+    bool stable_layer_norm = false; // true = pre-norm (XLS-R), false = post-norm (base/large)
     std::vector<int> conv_kernel, conv_stride;
     int pos_conv_kernel, pos_conv_groups;
 
@@ -148,7 +149,11 @@ wav2vec2_context * wav2vec2_init(const char * path) {
 
     m.vocab          = gguf_arr_str(gf, "tokenizer.ggml.tokens");
     m.vocab_size     = (int)m.vocab.size();
-    m.word_delimiter = "|";
+    m.word_delimiter = gf.kv.count("wav2vec2.word_delimiter_token")
+                     ? gf.kv.at("wav2vec2.word_delimiter_token").str
+                     : "|";
+    m.stable_layer_norm = gf.kv.count("wav2vec2.stable_layer_norm")
+                        && gf.kv.at("wav2vec2.stable_layer_norm").u64 != 0;
 
     // ── Collect all linear tensors to size the ggml context ─────────────────
     std::vector<const GgufTensor *> linear_tensors;
@@ -338,21 +343,46 @@ static std::vector<float> encode(const Wav2Vec2Model & m, GgmlScratch & scratch,
     for (int t = 0; t < use_T; t++)
         for (int i = 0; i < H; i++) x[t * H + i] += pos[t * H + i];
 
-    wv2_layer_norm(x.data(), m.enc_ln_w.data(), m.enc_ln_b.data(), T, H);
+    std::vector<float> attn_buf(T * H), ln_buf(T * H);
 
-    std::vector<float> attn_buf(T * H);
-    for (const auto & el : m.enc_layers) {
-        self_attention(el, scratch, attn_buf.data(), x.data(), T, H, m.n_heads, n_threads);
-        for (int i = 0; i < T * H; i++) x[i] += attn_buf[i];
-        wv2_layer_norm(x.data(), el.ln1_w.data(), el.ln1_b.data(), T, H);
+    if (!m.stable_layer_norm) {
+        // Post-norm (base / large-960h): global LN before layers, per-layer LN after residual
+        wv2_layer_norm(x.data(), m.enc_ln_w.data(), m.enc_ln_b.data(), T, H);
+        for (const auto & el : m.enc_layers) {
+            self_attention(el, scratch, attn_buf.data(), x.data(), T, H, m.n_heads, n_threads);
+            for (int i = 0; i < T * H; i++) x[i] += attn_buf[i];
+            wv2_layer_norm(x.data(), el.ln1_w.data(), el.ln1_b.data(), T, H);
 
-        auto ff1 = scratch.linear(el.ff.fc1_w, x.data(), T, H, m.intermediate, el.ff.fc1_b, n_threads);
-        for (auto & v : ff1) v = wv2_gelu(v);
-        auto ff2 = scratch.linear(el.ff.fc2_w, ff1.data(), T, m.intermediate, H, el.ff.fc2_b, n_threads);
-        for (int i = 0; i < T * H; i++) x[i] += ff2[i];
-        wv2_layer_norm(x.data(), el.ln2_w.data(), el.ln2_b.data(), T, H);
+            auto ff1 = scratch.linear(el.ff.fc1_w, x.data(), T, H, m.intermediate, el.ff.fc1_b, n_threads);
+            for (auto & v : ff1) v = wv2_gelu(v);
+            auto ff2 = scratch.linear(el.ff.fc2_w, ff1.data(), T, m.intermediate, H, el.ff.fc2_b, n_threads);
+            for (int i = 0; i < T * H; i++) x[i] += ff2[i];
+            wv2_layer_norm(x.data(), el.ln2_w.data(), el.ln2_b.data(), T, H);
+        }
+    } else {
+        // Pre-norm / stable_layer_norm (XLS-R): per-layer LN before sublayer, global LN after all layers
+        for (const auto & el : m.enc_layers) {
+            // LN → attention → residual
+            std::copy(x.begin(), x.end(), ln_buf.begin());
+            wv2_layer_norm(ln_buf.data(), el.ln1_w.data(), el.ln1_b.data(), T, H);
+            self_attention(el, scratch, attn_buf.data(), ln_buf.data(), T, H, m.n_heads, n_threads);
+            for (int i = 0; i < T * H; i++) x[i] += attn_buf[i];
+
+            // LN → feedforward → residual
+            std::copy(x.begin(), x.end(), ln_buf.begin());
+            wv2_layer_norm(ln_buf.data(), el.ln2_w.data(), el.ln2_b.data(), T, H);
+            auto ff1 = scratch.linear(el.ff.fc1_w, ln_buf.data(), T, H, m.intermediate, el.ff.fc1_b, n_threads);
+            for (auto & v : ff1) v = wv2_gelu(v);
+            auto ff2 = scratch.linear(el.ff.fc2_w, ff1.data(), T, m.intermediate, H, el.ff.fc2_b, n_threads);
+            for (int i = 0; i < T * H; i++) x[i] += ff2[i];
+        }
+        wv2_layer_norm(x.data(), m.enc_ln_w.data(), m.enc_ln_b.data(), T, H);
     }
     return x;
+}
+
+static bool is_special_token(const std::string & s) {
+    return s.size() >= 2 && s.front() == '<' && s.back() == '>';
 }
 
 static std::string ids_to_text(const std::vector<int> & ids, int blank_id,
@@ -362,7 +392,9 @@ static std::string ids_to_text(const std::vector<int> & ids, int blank_id,
     for (int id : ids) {
         if (id == blank_id || id < 0 || id >= (int)vocab.size()) continue;
         const auto & tok = vocab[id];
-        result += (tok == word_delim) ? " " : tok;
+        if (tok == word_delim)      { result += ' '; continue; }
+        if (is_special_token(tok))  continue;  // strip <s>, </s>, <unk>, etc.
+        result += tok;
     }
     auto start = result.find_first_not_of(' ');
     auto end   = result.find_last_not_of(' ');
